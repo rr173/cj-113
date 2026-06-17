@@ -50,12 +50,35 @@ class DieselState:
 
 
 @dataclass
+class DischargeRecord:
+    timestamp: datetime
+    discharge_power_kw: float
+    soc_before: float
+    soc_after: float
+    soc_drop_rate: float
+    duration_hours: float
+
+
+@dataclass
+class BatteryHealth:
+    equivalent_cycles: float = 0.0
+    last_cycle_soc_peak: Optional[float] = None
+    discharge_records: List[DischargeRecord] = field(default_factory=list)
+    baseline_soc_drop_rate: Optional[float] = None
+    internal_resistance_abnormal: bool = False
+    health_percent: float = 100.0
+    total_charged_for_cycle: float = 0.0
+    total_discharged_for_cycle: float = 0.0
+
+
+@dataclass
 class BessState:
     soc: float
     charge_power_kw: float = 0.0
     discharge_power_kw: float = 0.0
     total_charged_kwh: float = 0.0
     total_discharged_kwh: float = 0.0
+    health: BatteryHealth = field(default_factory=BatteryHealth)
 
 
 @dataclass
@@ -227,3 +250,201 @@ class MicrogridState:
         })
         if len(self.alerts) > 1000:
             self.alerts = self.alerts[-1000:]
+
+    def record_bess_discharge(self, bes_id: str, discharge_kw: float, soc_before: float,
+                               soc_after: float, duration_hours: float):
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        if discharge_kw <= 0:
+            return
+
+        soc_drop = soc_before - soc_after
+        if soc_drop <= 0:
+            return
+
+        soc_drop_rate = soc_drop / discharge_kw
+
+        record = DischargeRecord(
+            timestamp=datetime.now(),
+            discharge_power_kw=discharge_kw,
+            soc_before=soc_before,
+            soc_after=soc_after,
+            soc_drop_rate=soc_drop_rate,
+            duration_hours=duration_hours,
+        )
+
+        bh.discharge_records.append(record)
+        if len(bh.discharge_records) > cfg["max_discharge_records"]:
+            bh.discharge_records = bh.discharge_records[-cfg["max_discharge_records"]:]
+
+        self._update_internal_resistance_status(bes_id)
+
+    def record_bess_charge(self, bes_id: str, charge_kw: float, duration_hours: float):
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        if charge_kw <= 0:
+            return
+
+        energy_charged = charge_kw * duration_hours
+        bh.total_charged_for_cycle += energy_charged
+
+    def _update_cycle_count(self, bes_id: str, discharge_kw: float, duration_hours: float):
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        if discharge_kw <= 0:
+            return
+
+        energy_discharged = discharge_kw * duration_hours
+        bh.total_discharged_for_cycle += energy_discharged
+
+        capacity_kwh = cfg["capacity_kwh"]
+        full_cycle_energy = capacity_kwh
+
+        cycles_added = energy_discharged / full_cycle_energy
+        bh.equivalent_cycles += cycles_added
+
+        self._update_health_percent(bes_id)
+        self._check_life_warning(bes_id)
+
+    def _update_health_percent(self, bes_id: str):
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        cycle_threshold = cfg["cycle_life_threshold"]
+        cycle_factor = max(0.0, 1.0 - bh.equivalent_cycles / cycle_threshold)
+
+        resistance_factor = 0.85 if bh.internal_resistance_abnormal else 1.0
+
+        bh.health_percent = max(0.0, 100.0 * cycle_factor * resistance_factor)
+
+    def _check_life_warning(self, bes_id: str):
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        if bh.equivalent_cycles >= cfg["cycle_life_threshold"]:
+            self.add_alert(
+                "BATTERY_LIFE_WARNING",
+                f"电池{bes_id}等效循环次数已达{bh.equivalent_cycles:.1f}次，超过寿命阈值{cfg['cycle_life_threshold']}次",
+                {"bes_id": bes_id, "equivalent_cycles": bh.equivalent_cycles,
+                 "threshold": cfg["cycle_life_threshold"]}
+            )
+
+    def _update_internal_resistance_status(self, bes_id: str):
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        baseline_count = cfg["baseline_discharge_count"]
+        recent_count = cfg["recent_discharge_count"]
+        degradation_ratio = cfg["internal_resistance_degradation_ratio"]
+
+        if len(bh.discharge_records) < baseline_count + recent_count:
+            if len(bh.discharge_records) >= baseline_count and bh.baseline_soc_drop_rate is None:
+                baseline_records = bh.discharge_records[:baseline_count]
+                bh.baseline_soc_drop_rate = sum(r.soc_drop_rate for r in baseline_records) / baseline_count
+            return
+
+        if bh.baseline_soc_drop_rate is None:
+            baseline_records = bh.discharge_records[:baseline_count]
+            bh.baseline_soc_drop_rate = sum(r.soc_drop_rate for r in baseline_records) / baseline_count
+
+        recent_records = bh.discharge_records[-recent_count:]
+        recent_avg_rate = sum(r.soc_drop_rate for r in recent_records) / recent_count
+
+        baseline_rate = bh.baseline_soc_drop_rate
+        if baseline_rate <= 0:
+            return
+
+        rate_increase = (recent_avg_rate - baseline_rate) / baseline_rate
+
+        was_abnormal = bh.internal_resistance_abnormal
+        bh.internal_resistance_abnormal = rate_increase > degradation_ratio
+
+        if bh.internal_resistance_abnormal and not was_abnormal:
+            self.add_alert(
+                "BATTERY_RESISTANCE_ALERT",
+                f"电池{bes_id}内阻异常升高，最近{recent_count}次放电平均SOC下降速率比基线快{rate_increase*100:.1f}%",
+                {"bes_id": bes_id, "baseline_rate": baseline_rate,
+                 "recent_avg_rate": recent_avg_rate, "increase_ratio": rate_increase}
+            )
+
+        self._update_health_percent(bes_id)
+
+    def get_battery_health_report(self, bes_id: str) -> Dict[str, Any]:
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        recent_count = min(cfg["recent_discharge_count"], len(bh.discharge_records))
+        recent_trend = []
+        if recent_count > 0:
+            recent_records = bh.discharge_records[-recent_count:]
+            recent_trend = [
+                {
+                    "timestamp": r.timestamp.isoformat(),
+                    "discharge_power_kw": r.discharge_power_kw,
+                    "soc_drop_rate": r.soc_drop_rate,
+                }
+                for r in recent_records
+            ]
+
+        estimated_remaining_cycles = max(0.0, cfg["cycle_life_threshold"] - bh.equivalent_cycles)
+
+        return {
+            "bes_id": bes_id,
+            "equivalent_cycles": round(bh.equivalent_cycles, 2),
+            "cycle_life_threshold": cfg["cycle_life_threshold"],
+            "health_percent": round(bh.health_percent, 2),
+            "internal_resistance_abnormal": bh.internal_resistance_abnormal,
+            "baseline_soc_drop_rate": bh.baseline_soc_drop_rate,
+            "recent_discharge_count": len(bh.discharge_records),
+            "recent_soc_drop_trend": recent_trend,
+            "estimated_remaining_cycles": round(estimated_remaining_cycles, 2),
+            "power_derating_active": bh.health_percent < cfg["health_derating_threshold"],
+        }
+
+    def reset_baseline(self, bes_id: str) -> bool:
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        baseline_count = cfg["baseline_discharge_count"]
+        if len(bh.discharge_records) < baseline_count:
+            return False
+
+        recent_records = bh.discharge_records[-baseline_count:]
+        bh.baseline_soc_drop_rate = sum(r.soc_drop_rate for r in recent_records) / baseline_count
+        bh.internal_resistance_abnormal = False
+        self._update_health_percent(bes_id)
+        return True
+
+    def get_bess_max_discharge_with_health(self, bes_id: str, time_interval_hours: float) -> float:
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        base_max = self.get_bess_max_discharge(bes_id, time_interval_hours)
+
+        if bh.health_percent < cfg["health_derating_threshold"]:
+            derating = cfg["power_derating_ratio"]
+            return base_max * (1.0 - derating)
+        return base_max
+
+    def get_bess_max_charge_with_health(self, bes_id: str, time_interval_hours: float) -> float:
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        bh = bs.health
+
+        base_max = self.get_bess_max_charge(bes_id, time_interval_hours)
+
+        if bh.health_percent < cfg["health_derating_threshold"]:
+            derating = cfg["power_derating_ratio"]
+            return base_max * (1.0 - derating)
+        return base_max

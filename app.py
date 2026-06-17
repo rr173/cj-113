@@ -253,6 +253,54 @@ def get_bess_status():
     return jsonify({"status": "ok", "bess": result, "query_time": now.isoformat()})
 
 
+@app.route("/api/battery/health", methods=["GET"])
+def get_battery_health():
+    """
+    查询电池健康报告
+    参数: bes_id (可选，默认bes1)
+    """
+    bes_id = request.args.get("bes_id", "bes1")
+    if bes_id not in config.BESS_CONFIG:
+        return jsonify({"error": f"未找到储能设备: {bes_id}"}), 404
+
+    report = state.get_battery_health_report(bes_id)
+    return jsonify({
+        "status": "ok",
+        "health_report": report,
+        "query_time": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/battery/health/reset-baseline", methods=["POST"])
+def reset_battery_baseline():
+    """
+    手动重置电池内阻基线
+    请求体: {"bes_id": "bes1"}
+    """
+    data = request.get_json(force=True) or {}
+    bes_id = data.get("bes_id", "bes1")
+
+    if bes_id not in config.BESS_CONFIG:
+        return jsonify({"error": f"未找到储能设备: {bes_id}"}), 404
+
+    success = state.reset_baseline(bes_id)
+    if not success:
+        cfg = config.BESS_CONFIG[bes_id]
+        return jsonify({
+            "status": "error",
+            "message": f"放电记录不足，需要至少{cfg['baseline_discharge_count']}次放电数据才能重置基线",
+            "current_records": len(state.bess_state[bes_id].health.discharge_records),
+            "required": cfg["baseline_discharge_count"],
+        }), 400
+
+    report = state.get_battery_health_report(bes_id)
+    return jsonify({
+        "status": "ok",
+        "message": "基线已重置",
+        "health_report": report,
+    })
+
+
 @app.route("/api/status/tariff", methods=["GET"])
 def get_tariff_status():
     """
@@ -540,6 +588,8 @@ def _list_endpoints():
         "POST /api/dispatch/trigger - 手动触发调度",
         "GET /api/status/sources - 发电源状态",
         "GET /api/status/bess - 电池状态",
+        "GET /api/battery/health - 电池健康报告",
+        "POST /api/battery/health/reset-baseline - 重置电池内阻基线",
         "GET /api/status/tariff - 电价信息",
         "GET /api/status/load - 负荷状态",
         "GET /api/dispatch/history - 调度历史",

@@ -35,6 +35,13 @@ BESS_CONFIG = {
         "charge_efficiency": 0.95,
         "discharge_efficiency": 0.92,
         "name": "电池储能系统1",
+        "cycle_life_threshold": 3000,
+        "health_derating_threshold": 30,
+        "power_derating_ratio": 0.20,
+        "internal_resistance_degradation_ratio": 0.15,
+        "baseline_discharge_count": 100,
+        "recent_discharge_count": 30,
+        "max_discharge_records": 500,
     }
 }
 

@@ -12,7 +12,7 @@ class DispatchEngine:
         if self.state.last_dispatch_time is None:
             return config.DEFAULT_DISPATCH_INTERVAL_MINUTES / 60.0
         delta = (now - self.state.last_dispatch_time).total_seconds() / 3600.0
-        return max(delta, config.DEFAULT_DISPATCH_INTERVAL_MINUTES / 3600.0)
+        return max(delta, config.DEFAULT_DISPATCH_INTERVAL_MINUTES / 60.0)
 
     def execute(self, now: datetime = None) -> DispatchDecision:
         if now is None:
@@ -70,12 +70,18 @@ class DispatchEngine:
         ds_id = list(config.DIESEL_CONFIG.keys())[0]
 
         if remaining_load > 0:
-            max_discharge = self.state.get_bess_max_discharge(bes_id, time_interval_hours)
+            max_discharge_base = self.state.get_bess_max_discharge(bes_id, time_interval_hours)
+            max_discharge = self.state.get_bess_max_discharge_with_health(bes_id, time_interval_hours)
             discharge_kw = min(remaining_load, max_discharge)
             if discharge_kw > 0:
                 bess_action[bes_id]["discharge_kw"] = discharge_kw
                 remaining_load -= discharge_kw
                 notes.append(f"电池放电 {discharge_kw:.2f}kW")
+
+                bh = self.state.bess_state[bes_id].health
+                cfg = config.BESS_CONFIG[bes_id]
+                if bh.health_percent < cfg["health_derating_threshold"]:
+                    notes.append(f"电池健康度{bh.health_percent:.1f}% < {cfg['health_derating_threshold']}%，已降额{cfg['power_derating_ratio']*100:.0f}%运行")
 
             if remaining_load > 0:
                 use_grid = grid_buy_price < diesel_gen_cost
@@ -117,12 +123,17 @@ class DispatchEngine:
 
         elif remaining_load < 0:
             surplus = -remaining_load
-            max_charge = self.state.get_bess_max_charge(bes_id, time_interval_hours)
+            max_charge = self.state.get_bess_max_charge_with_health(bes_id, time_interval_hours)
             charge_kw = min(surplus, max_charge)
             if charge_kw > 0:
                 bess_action[bes_id]["charge_kw"] = charge_kw
                 surplus -= charge_kw
                 notes.append(f"电池充电 {charge_kw:.2f}kW")
+
+                bh = self.state.bess_state[bes_id].health
+                cfg = config.BESS_CONFIG[bes_id]
+                if bh.health_percent < cfg["health_derating_threshold"]:
+                    notes.append(f"电池健康度{bh.health_percent:.1f}% < {cfg['health_derating_threshold']}%，已降额{cfg['power_derating_ratio']*100:.0f}%运行")
 
             if surplus > 0:
                 grid_export_kw = surplus
@@ -146,6 +157,7 @@ class DispatchEngine:
                 notes.append(f"柴油机空载维持运行 (已运行 {elapsed:.1f}分钟，需满 {diesel_cfg['min_runtime_minutes']}分钟才能停机)")
                 self.state.diesel_state[ds_id].output_kw = 0.0
 
+        soc_before_dispatch = bess_action[bes_id]["soc_before"]
         self.state.update_bess_soc(
             bes_id,
             bess_action[bes_id]["charge_kw"],
@@ -153,6 +165,27 @@ class DispatchEngine:
             time_interval_hours
         )
         bess_action[bes_id]["soc_after"] = self.state.bess_state[bes_id].soc
+
+        if bess_action[bes_id]["discharge_kw"] > 0:
+            self.state.record_bess_discharge(
+                bes_id,
+                bess_action[bes_id]["discharge_kw"],
+                soc_before_dispatch,
+                bess_action[bes_id]["soc_after"],
+                time_interval_hours
+            )
+            self.state._update_cycle_count(
+                bes_id,
+                bess_action[bes_id]["discharge_kw"],
+                time_interval_hours
+            )
+
+        if bess_action[bes_id]["charge_kw"] > 0:
+            self.state.record_bess_charge(
+                bes_id,
+                bess_action[bes_id]["charge_kw"],
+                time_interval_hours
+            )
 
         for sid, kw in pv_output.items():
             self.state.stats.total_pv_generated_kwh[sid] += kw * time_interval_hours
