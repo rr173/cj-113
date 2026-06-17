@@ -383,6 +383,8 @@ def get_accumulated_stats():
     total_renewable = total_pv + total_wt
     total_generation = total_renewable + s.total_diesel_generated_kwh
 
+    arbitrage_net = s.arbitrage.total_arbitrage_revenue - s.arbitrage.total_arbitrage_cost
+
     return jsonify({
         "status": "ok",
         "stats": {
@@ -399,6 +401,7 @@ def get_accumulated_stats():
             },
             "grid_interaction_kwh": {
                 "total_imported": s.total_grid_import_kwh,
+                "total_load_imported": s.load_grid_import_kwh,
                 "total_exported": s.total_grid_export_kwh,
                 "net_imported": s.total_grid_import_kwh - s.total_grid_export_kwh,
             },
@@ -413,9 +416,88 @@ def get_accumulated_stats():
                 "total_cost": round(s.total_cost, 2),
                 "feed_in_tariff": config.FEED_IN_TARIFF,
             },
+            "storage_arbitrage": {
+                "total_arbitrage_charge_kwh": round(s.arbitrage.total_arbitrage_charge_kwh, 4),
+                "total_arbitrage_discharge_kwh": round(s.arbitrage.total_arbitrage_discharge_kwh, 4),
+                "arbitrage_cost": round(s.arbitrage.total_arbitrage_cost, 4),
+                "arbitrage_revenue": round(s.arbitrage.total_arbitrage_revenue, 4),
+                "arbitrage_net_profit": round(arbitrage_net, 4),
+            },
         },
         "dispatch_count": len(state.dispatch_history),
         "query_time": now.isoformat(),
+    })
+
+
+@app.route("/api/storage/plan", methods=["GET"])
+def get_storage_plan():
+    """
+    查询当前生效的储能计划
+    """
+    report = state.get_storage_plan_report()
+    return jsonify({
+        "status": "ok",
+        "plan": report,
+        "query_time": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/storage/plan/regenerate", methods=["POST"])
+def regenerate_storage_plan():
+    """
+    手动触发重新生成储能计划
+    """
+    now = datetime.now()
+    plan = state.generate_storage_plan(now)
+    report = state.get_storage_plan_report()
+    return jsonify({
+        "status": "ok",
+        "message": f"储能计划已重新生成，计划日期: {plan.plan_date}",
+        "plan": report,
+        "generated_at": now.isoformat(),
+    })
+
+
+@app.route("/api/storage/plan/generation-time", methods=["PUT"])
+def update_plan_generation_time():
+    """
+    修改储能计划生成时刻
+    请求体: {"hour": 0, "minute": 30}
+    """
+    data = request.get_json(force=True) or {}
+    hour = data.get("hour")
+    minute = data.get("minute")
+
+    if hour is None or minute is None:
+        return jsonify({"error": "缺少必填字段: hour, minute"}), 400
+
+    try:
+        hour = int(hour)
+        minute = int(minute)
+    except (ValueError, TypeError):
+        return jsonify({"error": "hour 和 minute 必须是整数"}), 400
+
+    success = state.update_plan_generation_time(hour, minute)
+    if not success:
+        return jsonify({"error": "hour 必须在 [0,23]，minute 必须在 [0,59]"}), 400
+
+    return jsonify({
+        "status": "ok",
+        "message": f"计划生成时刻已更新为 {hour:02d}:{minute:02d}",
+        "plan_generation_time": f"{hour:02d}:{minute:02d}",
+    })
+
+
+@app.route("/api/storage/arbitrage/stats", methods=["GET"])
+def get_arbitrage_stats():
+    """
+    查询储能套利统计
+    """
+    report = state.get_arbitrage_stats_report()
+    return jsonify({
+        "status": "ok",
+        "arbitrage_stats": report,
+        "query_time": datetime.now().isoformat(),
     })
 
 
@@ -593,7 +675,11 @@ def _list_endpoints():
         "GET /api/status/tariff - 电价信息",
         "GET /api/status/load - 负荷状态",
         "GET /api/dispatch/history - 调度历史",
-        "GET /api/stats/accumulated - 累计统计",
+        "GET /api/stats/accumulated - 累计统计(含储能套利)",
+        "GET /api/storage/plan - 查询当前储能计划",
+        "POST /api/storage/plan/regenerate - 手动重新生成储能计划",
+        "PUT /api/storage/plan/generation-time - 修改计划生成时刻",
+        "GET /api/storage/arbitrage/stats - 查询储能套利统计",
         "GET /api/alerts - 告警记录",
         "PUT /api/config/tariff - 修改电价配置",
         "PUT /api/config/bess_soc - 修改SOC区间",

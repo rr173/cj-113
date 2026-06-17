@@ -99,12 +99,12 @@ print(f"  等效循环: {bh2.equivalent_cycles}")
 print(f"  健康度: {bh2.health_percent:.2f}%")
 print(f"  降额阈值: {cfg['health_derating_threshold']}%")
 
-now = datetime.now()
+now = datetime(2026, 6, 17, 9, 0, 0)
 state2.pv_reports["pv1"] = SourceReport("pv1", "pv", 0.0, True, now)
 state2.pv_reports["pv2"] = SourceReport("pv2", "pv", 0.0, True, now)
 state2.wt_reports["wt1"] = SourceReport("wt1", "wt", 0.0, True, now)
 state2.diesel_reports["ds1"] = SourceReport("ds1", "diesel", 0.0, False, now)
-state2.load_report = LoadReport(500.0, now)  # 大负荷，让电池放满功率
+state2.load_report = LoadReport(500.0, now)
 
 decision = engine2.execute(now)
 

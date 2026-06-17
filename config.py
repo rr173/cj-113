@@ -4,6 +4,17 @@ from datetime import datetime
 # 微网设备配置
 # ============================================
 
+# ============================================
+# 分时段储能策略配置
+# ============================================
+STORAGE_STRATEGY_CONFIG = {
+    "plan_generation_hour": 0,
+    "plan_generation_minute": 0,
+    "min_arbitrage_profit_ratio": 0.05,
+    "enable_strategy": True,
+}
+
+
 PV_CONFIG = {
     "pv1": {"rated_power": 100.0, "name": "光伏阵列1"},
     "pv2": {"rated_power": 100.0, "name": "光伏阵列2"},
@@ -78,3 +89,25 @@ def get_grid_buy_price(now: datetime = None) -> float:
 def get_soc_limits():
     cfg = BESS_CONFIG["bes1"]
     return cfg["soc_min"], cfg["soc_max"]
+
+
+def get_storage_mode_for_hour(hour: int) -> str:
+    period = get_tariff_period(hour)
+    if period == "valley":
+        return "active_charge"
+    elif period == "peak":
+        return "priority_discharge"
+    else:
+        return "normal"
+
+
+def get_valley_price() -> float:
+    return GRID_TARIFF["valley"]["price"]
+
+
+def get_peak_price() -> float:
+    return GRID_TARIFF["peak"]["price"]
+
+
+def get_flat_price() -> float:
+    return GRID_TARIFF["flat"]["price"]

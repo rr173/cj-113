@@ -82,6 +82,31 @@ class BessState:
 
 
 @dataclass
+class StoragePlanHour:
+    hour: int
+    mode: str
+    tariff_period: str
+    target_soc: Optional[float] = None
+    active: bool = True
+    abnormal: bool = False
+
+
+@dataclass
+class StorageArbitrageStats:
+    total_arbitrage_charge_kwh: float = 0.0
+    total_arbitrage_discharge_kwh: float = 0.0
+    total_arbitrage_cost: float = 0.0
+    total_arbitrage_revenue: float = 0.0
+
+
+@dataclass
+class StoragePlan:
+    plan_date: str
+    generated_at: datetime
+    hours: Dict[int, StoragePlanHour] = field(default_factory=dict)
+
+
+@dataclass
 class AccumulatedStats:
     total_pv_generated_kwh: Dict[str, float] = field(default_factory=dict)
     total_wt_generated_kwh: Dict[str, float] = field(default_factory=dict)
@@ -91,6 +116,8 @@ class AccumulatedStats:
     total_diesel_starts: int = 0
     total_cost: float = 0.0
     total_load_shed_kwh: float = 0.0
+    arbitrage: StorageArbitrageStats = field(default_factory=StorageArbitrageStats)
+    load_grid_import_kwh: float = 0.0
 
 
 class MicrogridState:
@@ -118,6 +145,11 @@ class MicrogridState:
 
         self.last_dispatch_time: Optional[datetime] = None
         self.alerts: List[Dict[str, Any]] = []
+
+        self.current_storage_plan: Optional[StoragePlan] = None
+        self.last_plan_generation_date: Optional[str] = None
+        self.plan_generation_hour: int = config.STORAGE_STRATEGY_CONFIG["plan_generation_hour"]
+        self.plan_generation_minute: int = config.STORAGE_STRATEGY_CONFIG["plan_generation_minute"]
 
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
@@ -459,3 +491,169 @@ class MicrogridState:
             derating = cfg["power_derating_ratio"]
             return base_max * (1.0 - derating)
         return base_max
+
+    def generate_storage_plan(self, now: datetime = None) -> StoragePlan:
+        if now is None:
+            now = datetime.now()
+
+        plan_date = now.strftime("%Y-%m-%d")
+        plan = StoragePlan(plan_date=plan_date, generated_at=now)
+
+        valley_price = config.get_valley_price()
+        peak_price = config.get_peak_price()
+        charge_eff = config.BESS_CONFIG[list(config.BESS_CONFIG.keys())[0]]["charge_efficiency"]
+        discharge_eff = config.BESS_CONFIG[list(config.BESS_CONFIG.keys())[0]]["discharge_efficiency"]
+        min_ratio = config.STORAGE_STRATEGY_CONFIG["min_arbitrage_profit_ratio"]
+
+        arbitrage_feasible = False
+        if valley_price > 0:
+            expected_revenue_per_kwh = peak_price * discharge_eff
+            expected_cost_per_kwh = valley_price / charge_eff
+            profit_ratio = (expected_revenue_per_kwh - expected_cost_per_kwh) / expected_cost_per_kwh
+            if profit_ratio >= min_ratio:
+                arbitrage_feasible = True
+
+        for hour in range(24):
+            period = config.get_tariff_period(hour)
+            mode = config.get_storage_mode_for_hour(hour)
+
+            if mode == "active_charge" and not arbitrage_feasible:
+                mode = "normal"
+
+            plan.hours[hour] = StoragePlanHour(
+                hour=hour,
+                mode=mode,
+                tariff_period=period,
+                active=True,
+                abnormal=False,
+            )
+
+        self.current_storage_plan = plan
+        self.last_plan_generation_date = plan_date
+        return plan
+
+    def should_generate_plan(self, now: datetime = None) -> bool:
+        if now is None:
+            now = datetime.now()
+
+        if not config.STORAGE_STRATEGY_CONFIG["enable_strategy"]:
+            return False
+
+        today_str = now.strftime("%Y-%m-%d")
+        if self.last_plan_generation_date == today_str and self.current_storage_plan is not None:
+            return False
+
+        gen_hour = self.plan_generation_hour
+        gen_minute = self.plan_generation_minute
+
+        if now.hour > gen_hour or (now.hour == gen_hour and now.minute >= gen_minute):
+            return True
+
+        return False
+
+    def get_current_hour_plan(self, now: datetime = None) -> Optional[StoragePlanHour]:
+        if now is None:
+            now = datetime.now()
+        if self.current_storage_plan is None:
+            return None
+        return self.current_storage_plan.hours.get(now.hour)
+
+    def check_and_handle_soc_abnormal(self, bes_id: str, now: datetime = None) -> bool:
+        if now is None:
+            now = datetime.now()
+        if self.current_storage_plan is None:
+            return False
+
+        cfg = config.BESS_CONFIG[bes_id]
+        bs = self.bess_state[bes_id]
+        current_plan = self.current_storage_plan.hours.get(now.hour)
+
+        if current_plan is None:
+            return False
+
+        if bs.soc < cfg["soc_min"]:
+            if not current_plan.abnormal:
+                current_plan.abnormal = True
+                current_plan.active = False
+                self.add_alert(
+                    "STORAGE_PLAN_SUSPENDED",
+                    f"电池{bes_id} SOC({bs.soc*100:.1f}%)低于下限({cfg['soc_min']*100:.1f}%)，当前时段({now.hour}时)储能计划暂停",
+                    {"bes_id": bes_id, "soc": bs.soc, "soc_min": cfg["soc_min"], "hour": now.hour}
+                )
+            return True
+        else:
+            if current_plan.abnormal:
+                current_plan.abnormal = False
+                current_plan.active = True
+                self.add_alert(
+                    "STORAGE_PLAN_RESUMED",
+                    f"电池{bes_id} SOC恢复至安全区间，当前时段({now.hour}时)储能计划恢复执行",
+                    {"bes_id": bes_id, "soc": bs.soc, "hour": now.hour}
+                )
+        return False
+
+    def get_storage_plan_report(self) -> Dict[str, Any]:
+        if self.current_storage_plan is None:
+            return {
+                "plan_exists": False,
+                "message": "暂无生效的储能计划",
+            }
+
+        hours_info = []
+        for h in range(24):
+            hp = self.current_storage_plan.hours.get(h)
+            if hp:
+                hours_info.append({
+                    "hour": h,
+                    "mode": hp.mode,
+                    "mode_chinese": {
+                        "active_charge": "主动充电",
+                        "priority_discharge": "优先放电",
+                        "normal": "常规模式",
+                    }.get(hp.mode, "未知"),
+                    "tariff_period": hp.tariff_period,
+                    "period_chinese": {
+                        "valley": "谷时段",
+                        "flat": "平时段",
+                        "peak": "峰时段",
+                    }.get(hp.tariff_period, "未知"),
+                    "active": hp.active,
+                    "abnormal": hp.abnormal,
+                })
+
+        return {
+            "plan_exists": True,
+            "plan_date": self.current_storage_plan.plan_date,
+            "generated_at": self.current_storage_plan.generated_at.isoformat(),
+            "plan_generation_time": f"{self.plan_generation_hour:02d}:{self.plan_generation_minute:02d}",
+            "hours": hours_info,
+        }
+
+    def get_arbitrage_stats_report(self) -> Dict[str, Any]:
+        a = self.stats.arbitrage
+        net_profit = a.total_arbitrage_revenue - a.total_arbitrage_cost
+        return {
+            "total_arbitrage_charge_kwh": round(a.total_arbitrage_charge_kwh, 4),
+            "total_arbitrage_discharge_kwh": round(a.total_arbitrage_discharge_kwh, 4),
+            "total_arbitrage_cost": round(a.total_arbitrage_cost, 4),
+            "total_arbitrage_revenue": round(a.total_arbitrage_revenue, 4),
+            "net_profit": round(net_profit, 4),
+            "charge_count": int(a.total_arbitrage_charge_kwh > 0),
+        }
+
+    def update_plan_generation_time(self, hour: int, minute: int) -> bool:
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return False
+        self.plan_generation_hour = hour
+        self.plan_generation_minute = minute
+        config.STORAGE_STRATEGY_CONFIG["plan_generation_hour"] = hour
+        config.STORAGE_STRATEGY_CONFIG["plan_generation_minute"] = minute
+        return True
+
+    def record_arbitrage_charge(self, energy_kwh: float, cost: float):
+        self.stats.arbitrage.total_arbitrage_charge_kwh += energy_kwh
+        self.stats.arbitrage.total_arbitrage_cost += cost
+
+    def record_arbitrage_discharge(self, energy_kwh: float, revenue: float):
+        self.stats.arbitrage.total_arbitrage_discharge_kwh += energy_kwh
+        self.stats.arbitrage.total_arbitrage_revenue += revenue
