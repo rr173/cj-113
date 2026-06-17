@@ -70,7 +70,6 @@ class DispatchEngine:
         ds_id = list(config.DIESEL_CONFIG.keys())[0]
 
         if remaining_load > 0:
-            max_discharge_base = self.state.get_bess_max_discharge(bes_id, time_interval_hours)
             max_discharge = self.state.get_bess_max_discharge_with_health(bes_id, time_interval_hours)
             discharge_kw = min(remaining_load, max_discharge)
             if discharge_kw > 0:
@@ -78,6 +77,7 @@ class DispatchEngine:
                 remaining_load -= discharge_kw
                 notes.append(f"电池放电 {discharge_kw:.2f}kW")
 
+                self.state._update_health_percent(bes_id)
                 bh = self.state.bess_state[bes_id].health
                 cfg = config.BESS_CONFIG[bes_id]
                 if bh.health_percent < cfg["health_derating_threshold"]:
@@ -130,6 +130,7 @@ class DispatchEngine:
                 surplus -= charge_kw
                 notes.append(f"电池充电 {charge_kw:.2f}kW")
 
+                self.state._update_health_percent(bes_id)
                 bh = self.state.bess_state[bes_id].health
                 cfg = config.BESS_CONFIG[bes_id]
                 if bh.health_percent < cfg["health_derating_threshold"]:

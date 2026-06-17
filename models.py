@@ -264,7 +264,11 @@ class MicrogridState:
         if soc_drop <= 0:
             return
 
-        soc_drop_rate = soc_drop / discharge_kw
+        energy_discharged_kwh = discharge_kw * duration_hours
+        if energy_discharged_kwh <= 0:
+            return
+
+        soc_drop_rate = soc_drop / energy_discharged_kwh
 
         record = DischargeRecord(
             timestamp=datetime.now(),
@@ -382,6 +386,9 @@ class MicrogridState:
         bs = self.bess_state[bes_id]
         bh = bs.health
 
+        self._update_health_percent(bes_id)
+        self._update_internal_resistance_status(bes_id)
+
         recent_count = min(cfg["recent_discharge_count"], len(bh.discharge_records))
         recent_trend = []
         if recent_count > 0:
@@ -430,6 +437,8 @@ class MicrogridState:
         bs = self.bess_state[bes_id]
         bh = bs.health
 
+        self._update_health_percent(bes_id)
+
         base_max = self.get_bess_max_discharge(bes_id, time_interval_hours)
 
         if bh.health_percent < cfg["health_derating_threshold"]:
@@ -441,6 +450,8 @@ class MicrogridState:
         cfg = config.BESS_CONFIG[bes_id]
         bs = self.bess_state[bes_id]
         bh = bs.health
+
+        self._update_health_percent(bes_id)
 
         base_max = self.get_bess_max_charge(bes_id, time_interval_hours)
 
