@@ -91,6 +91,7 @@ class DispatchEngine:
                         diesel_kw = min(remaining_load, diesel_cap["max_output"])
                         diesel_output[ds_id] = diesel_kw
                         remaining_load -= diesel_kw
+                        self.state.diesel_state[ds_id].output_kw = diesel_kw
 
                         total_cost += diesel_kw * time_interval_hours * diesel_gen_cost
 
@@ -100,11 +101,7 @@ class DispatchEngine:
                             self.state.start_diesel(ds_id, now)
                             notes.append(f"启动柴油机 (固定成本 {startup_cost}元)，出力 {diesel_kw:.2f}kW")
                         else:
-                            self.state.diesel_state[ds_id].output_kw = diesel_kw
-                            notes.append(f"柴油机持续运行，出力 {diesel_kw:.2f}kW")
-
-                        if diesel_cap.get("can_run") and not diesel_cap.get("already_running", False):
-                            pass
+                            notes.append(f"柴油机恢复/持续运行，出力 {diesel_kw:.2f}kW")
                     else:
                         notes.append(f"柴油机不可用: {diesel_cap.get('reason', '未知原因')}，且购电价({grid_buy_price})高于柴油成本({diesel_gen_cost})，不选择买电")
 

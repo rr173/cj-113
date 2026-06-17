@@ -118,7 +118,7 @@ curl -X PUT http://127.0.0.1:5000/api/config/bess_soc \
 ### 5. 手动触发调度
 
 ```bash
-curl -X POST http://127.0.0.1:5000/api/dispatch/trigger
+curl -X POST http://127.0.0.1:5001/api/dispatch/trigger
 ```
 
 ## 运行测试

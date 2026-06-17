@@ -56,7 +56,9 @@ if "dispatch_decision" in res:
         print(f"      -> {note}")
     ds_res = get("/api/status/sources")
     ds = list(ds_res["sources"]["diesel_generator"].values())[0]
-    print(f"\n  柴油机状态: 运行={ds['running']}, 累计启动={ds['total_starts']}次")
+    print(f"\n  柴油机状态: 运行={ds['running']}, 出力={ds['current_output_kw']:.1f}kW, 累计启动={ds['total_starts']}次")
+    assert ds["current_output_kw"] > 0, "BUG: 柴油机已启动但状态查询出力为0！"
+    print(f"  ✅ 修复验证: 柴油机状态查询出力正确（{ds['current_output_kw']:.1f}kW）")
 
 print("\n" + "="*60)
 print("  专项测试: 柴油机最小运行时间约束 (再调度一次，负荷很小但柴油机不能停)")
@@ -72,6 +74,34 @@ if "dispatch_decision" in res:
     for note in d["notes"]:
         if "柴油机" in note or "空载" in note:
             print(f"    -> {note}")
+    ds_res = get("/api/status/sources")
+    ds = list(ds_res["sources"]["diesel_generator"].values())[0]
+    print(f"  柴油机状态: 运行={ds['running']}, 出力={ds['current_output_kw']:.1f}kW (空载)")
+
+print("\n" + "="*60)
+print("  专项测试: 柴油机空载后负荷再上来 -> 直接恢复出力，不扣启动费")
+print("="*60)
+time.sleep(1.1)
+res = report_round(pv1=20, pv2=20, wt1=10, load=350)
+if "dispatch_decision" in res:
+    d = res["dispatch_decision"]
+    print(f"  负荷 350kW，新能源 50kW，缺口 300kW")
+    diesel_kw = sum(d["diesel_output_kw"].values())
+    print(f"  柴油机出力: {diesel_kw:.1f}kW")
+    print(f"  电池放电: {d['bess_action']['bes1']['discharge_kw']:.1f}kW")
+    print(f"  本轮调度成本: {d['decision_cost']:.2f}元")
+    print(f"  调度备注:")
+    startup_fee_applied = False
+    for note in d["notes"]:
+        print(f"    -> {note}")
+        if "启动柴油机" in note and "固定成本" in note:
+            startup_fee_applied = True
+    ds_res = get("/api/status/sources")
+    ds = list(ds_res["sources"]["diesel_generator"].values())[0]
+    print(f"  柴油机状态: 运行={ds['running']}, 出力={ds['current_output_kw']:.1f}kW, 累计启动={ds['total_starts']}次")
+    assert ds["total_starts"] == 1, f"BUG: 柴油机应该只启动1次，但显示{ds['total_starts']}次！"
+    assert not startup_fee_applied, "BUG: 空载恢复出力不应再扣启动费！"
+    print(f"  ✅ 修复验证: 柴油机累计启动仍为{ds['total_starts']}次，空载恢复出力未重复扣费")
 
 print("\n" + "="*60)
 print("  专项测试: 柴油机不可用 + 电池耗尽 -> 甩负荷告警")
