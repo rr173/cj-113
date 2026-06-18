@@ -1249,3 +1249,189 @@ class SimulationComparisonReport:
                 "final_soc_percent": {k: round(v * 100, 2) for k, v in self.final_soc_diff.items()},
             }
         }
+
+
+@dataclass
+class PriceForecastRecord:
+    forecast_id: str
+    forecast_date: str
+    prices: List[float]
+    submitted_at: datetime
+    status: str = "pending"
+    activated_at: Optional[datetime] = None
+    deactivated_at: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "forecast_id": self.forecast_id,
+            "forecast_date": self.forecast_date,
+            "prices": [round(p, 4) for p in self.prices],
+            "submitted_at": self.submitted_at.isoformat(),
+            "status": self.status,
+            "status_chinese": {
+                "pending": "待激活",
+                "active": "已激活",
+                "expired": "已过期",
+                "deactivated": "已停用",
+            }.get(self.status, self.status),
+            "activated_at": self.activated_at.isoformat() if self.activated_at else None,
+            "deactivated_at": self.deactivated_at.isoformat() if self.deactivated_at else None,
+        }
+
+
+@dataclass
+class PriceComparisonHour:
+    hour: int
+    forecast_price: float
+    fixed_price: float
+    fixed_period: str
+    price_diff: float
+    price_diff_ratio: float
+    is_valley_opportunity: bool
+    is_peak_risk: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "hour": self.hour,
+            "forecast_price": round(self.forecast_price, 4),
+            "fixed_price": round(self.fixed_price, 4),
+            "fixed_period": self.fixed_period,
+            "fixed_period_chinese": {
+                "valley": "谷时段",
+                "flat": "平时段",
+                "peak": "峰时段",
+            }.get(self.fixed_period, "未知"),
+            "price_diff": round(self.price_diff, 4),
+            "price_diff_ratio": round(self.price_diff_ratio, 4),
+            "is_valley_opportunity": self.is_valley_opportunity,
+            "is_peak_risk": self.is_peak_risk,
+        }
+
+
+@dataclass
+class PriceComparisonResult:
+    forecast_id: str
+    forecast_date: str
+    hours: List[PriceComparisonHour]
+    valley_opportunity_hours: List[int]
+    peak_risk_hours: List[int]
+    total_valley_savings_potential: float
+    total_peak_risk_cost: float
+    valley_price_threshold: float
+    peak_price_threshold: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "forecast_id": self.forecast_id,
+            "forecast_date": self.forecast_date,
+            "hours": [h.to_dict() for h in self.hours],
+            "valley_opportunity_hours": self.valley_opportunity_hours,
+            "peak_risk_hours": self.peak_risk_hours,
+            "valley_opportunity_count": len(self.valley_opportunity_hours),
+            "peak_risk_count": len(self.peak_risk_hours),
+            "total_valley_savings_potential": round(self.total_valley_savings_potential, 4),
+            "total_peak_risk_cost": round(self.total_peak_risk_cost, 4),
+            "valley_price_threshold": round(self.valley_price_threshold, 4),
+            "peak_price_threshold": round(self.peak_price_threshold, 4),
+        }
+
+
+@dataclass
+class StrategySuggestionHour:
+    hour: int
+    suggested_action: str
+    reason: str
+    forecast_price: float
+    fixed_price: float
+    target_soc: Optional[float] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "hour": self.hour,
+            "suggested_action": self.suggested_action,
+            "suggested_action_chinese": {
+                "active_charge": "主动充电",
+                "priority_discharge": "优先放电",
+                "force_discharge_no_grid": "强制放电禁止购电",
+                "normal": "常规模式",
+            }.get(self.suggested_action, self.suggested_action),
+            "reason": self.reason,
+            "forecast_price": round(self.forecast_price, 4),
+            "fixed_price": round(self.fixed_price, 4),
+            "target_soc": round(self.target_soc, 4) if self.target_soc is not None else None,
+        }
+
+
+@dataclass
+class PurchaseStrategy:
+    strategy_id: str
+    forecast_id: str
+    forecast_date: str
+    generated_at: datetime
+    status: str
+    hours: List[StrategySuggestionHour]
+    summary: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "strategy_id": self.strategy_id,
+            "forecast_id": self.forecast_id,
+            "forecast_date": self.forecast_date,
+            "generated_at": self.generated_at.isoformat(),
+            "status": self.status,
+            "status_chinese": {
+                "pending": "待激活",
+                "active": "已激活",
+                "expired": "已过期",
+                "deactivated": "已停用",
+            }.get(self.status, self.status),
+            "hours": [h.to_dict() for h in self.hours],
+            "summary": self.summary,
+        }
+
+
+@dataclass
+class StrategyExecutionDayStats:
+    date: str
+    strategy_used: bool
+    strategy_id: Optional[str]
+    avg_buy_price: float
+    total_grid_import_kwh: float
+    total_buy_cost: float
+    total_load_served_kwh: float
+    total_load_shed_kwh: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "date": self.date,
+            "strategy_used": self.strategy_used,
+            "strategy_id": self.strategy_id,
+            "avg_buy_price": round(self.avg_buy_price, 4),
+            "total_grid_import_kwh": round(self.total_grid_import_kwh, 4),
+            "total_buy_cost": round(self.total_buy_cost, 4),
+            "total_load_served_kwh": round(self.total_load_served_kwh, 4),
+            "total_load_shed_kwh": round(self.total_load_shed_kwh, 4),
+        }
+
+
+@dataclass
+class StrategyExecutionStatsSummary:
+    strategy_days: int
+    no_strategy_days: int
+    avg_cost_with_strategy: float
+    avg_cost_without_strategy: float
+    cost_saving_ratio: float
+    total_saving: float
+    details: List[StrategyExecutionDayStats] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "strategy_days": self.strategy_days,
+            "no_strategy_days": self.no_strategy_days,
+            "avg_cost_with_strategy": round(self.avg_cost_with_strategy, 4),
+            "avg_cost_without_strategy": round(self.avg_cost_without_strategy, 4),
+            "cost_saving_ratio": round(self.cost_saving_ratio, 4),
+            "cost_saving_ratio_percent": f"{self.cost_saving_ratio * 100:.2f}%",
+            "total_saving": round(self.total_saving, 4),
+            "details": [d.to_dict() for d in self.details],
+        }

@@ -7,12 +7,14 @@ from models import MicrogridState, SourceReport, LoadReport, SimulationStatus
 from dispatcher import DispatchEngine
 from simulation import SimulationEngine
 from demand_response import DemandResponseManager
+from price_forecast import PriceForecastManager
 
 app = Flask(__name__)
 
 state = MicrogridState()
 dr_manager = DemandResponseManager(state)
-engine = DispatchEngine(state, dr_manager)
+price_forecast_manager = PriceForecastManager(state)
+engine = DispatchEngine(state, dr_manager, price_forecast_manager)
 sim_engine = SimulationEngine(state)
 
 
@@ -1477,8 +1479,249 @@ def compare_simulations():
     })
 
 
+@app.route("/api/price-forecast/submit", methods=["POST"])
+def submit_price_forecast():
+    """
+    提交次日电价预告
+    请求体: {
+        "prices": [0.35, 0.35, ...],  // 24个浮点数，单位元/kWh
+        "forecast_date": "2024-01-01"  // 可选，默认次日
+    }
+    """
+    data = request.get_json(force=True) or {}
+
+    if "prices" not in data:
+        return jsonify({"error": "缺少必填字段: prices"}), 400
+
+    prices = data["prices"]
+    if not isinstance(prices, list) or len(prices) != 24:
+        return jsonify({"error": "prices 必须是包含24个浮点数的列表"}), 400
+
+    try:
+        prices = [float(p) for p in prices]
+    except (ValueError, TypeError):
+        return jsonify({"error": "prices 中的值必须是数字"}), 400
+
+    forecast_date = data.get("forecast_date")
+    if forecast_date is not None:
+        try:
+            datetime.strptime(forecast_date, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "forecast_date 格式必须为 YYYY-MM-DD"}), 400
+
+    try:
+        result = price_forecast_manager.submit_forecast(prices, forecast_date)
+        return jsonify({
+            "status": "ok",
+            "message": "电价预告已提交，策略建议已生成（待激活状态）",
+            "forecast": result["forecast"].to_dict(),
+            "comparison": result["comparison"].to_dict(),
+            "strategy": result["strategy"].to_dict(),
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/price-forecast/current", methods=["GET"])
+def get_current_price_forecast():
+    """
+    查询当前生效的电价预告和对比分析结果
+    """
+    forecast = price_forecast_manager.get_active_forecast()
+    strategy = price_forecast_manager.get_active_strategy()
+
+    result = {
+        "has_active_forecast": forecast is not None,
+    }
+
+    if forecast:
+        comparison = price_forecast_manager.get_comparison(forecast.forecast_id)
+        result["forecast"] = forecast.to_dict()
+        result["comparison"] = comparison.to_dict() if comparison else None
+        result["strategy"] = strategy.to_dict() if strategy else None
+    else:
+        result["message"] = "当前无生效的电价预告策略"
+
+    return jsonify({
+        "status": "ok",
+        "data": result,
+        "query_time": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/price-forecast/strategy", methods=["GET"])
+def get_strategy_detail():
+    """
+    查询策略建议详情（各时段建议动作）
+    参数: forecast_id (可选，默认查当前激活的)
+    """
+    forecast_id = request.args.get("forecast_id")
+
+    if forecast_id:
+        strategy = price_forecast_manager.get_strategy_by_forecast(forecast_id)
+        forecast = price_forecast_manager.get_forecast(forecast_id)
+    else:
+        strategy = price_forecast_manager.get_active_strategy()
+        forecast = price_forecast_manager.get_active_forecast()
+
+    if not strategy:
+        return jsonify({"error": "未找到对应的策略建议"}), 404
+
+    return jsonify({
+        "status": "ok",
+        "forecast": forecast.to_dict() if forecast else None,
+        "strategy": strategy.to_dict(),
+        "query_time": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/price-forecast/activate", methods=["POST"])
+def activate_strategy():
+    """
+    激活电价策略
+    请求体: {"forecast_id": "FCST-000001"}
+    """
+    data = request.get_json(force=True) or {}
+    forecast_id = data.get("forecast_id")
+
+    if not forecast_id:
+        return jsonify({"error": "缺少必填字段: forecast_id"}), 400
+
+    success = price_forecast_manager.activate_strategy(forecast_id)
+    if not success:
+        return jsonify({"error": "激活失败，电价预告不存在或状态不正确"}), 400
+
+    forecast = price_forecast_manager.get_forecast(forecast_id)
+    strategy = price_forecast_manager.get_strategy_by_forecast(forecast_id)
+
+    return jsonify({
+        "status": "ok",
+        "message": "电价策略已激活，将覆盖当天的储能计划模式",
+        "forecast": forecast.to_dict() if forecast else None,
+        "strategy": strategy.to_dict() if strategy else None,
+        "activated_at": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/price-forecast/deactivate", methods=["POST"])
+def deactivate_strategy():
+    """
+    停用电价策略
+    请求体: {"forecast_id": "FCST-000001"}
+    """
+    data = request.get_json(force=True) or {}
+    forecast_id = data.get("forecast_id")
+
+    if not forecast_id:
+        return jsonify({"error": "缺少必填字段: forecast_id"}), 400
+
+    success = price_forecast_manager.deactivate_strategy(forecast_id)
+    if not success:
+        return jsonify({"error": "停用失败，电价预告不存在或状态不正确"}), 400
+
+    return jsonify({
+        "status": "ok",
+        "message": "电价策略已停用，已恢复固定电价模式",
+        "forecast_id": forecast_id,
+        "deactivated_at": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/price-forecast/history", methods=["GET"])
+def get_price_forecast_history():
+    """
+    查询历史电价预告记录
+    参数: date (可选，按日期查询), limit (可选，默认30)
+    """
+    date_str = request.args.get("date")
+    limit = request.args.get("limit", 30)
+
+    try:
+        limit = int(limit)
+    except (ValueError, TypeError):
+        return jsonify({"error": "limit 必须是整数"}), 400
+
+    if date_str:
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "date 格式必须为 YYYY-MM-DD"}), 400
+
+        forecast = price_forecast_manager.get_forecast_by_date(date_str)
+        if forecast:
+            comparison = price_forecast_manager.get_comparison(forecast.forecast_id)
+            strategy = price_forecast_manager.get_strategy_by_forecast(forecast.forecast_id)
+            return jsonify({
+                "status": "ok",
+                "total": 1,
+                "forecasts": [{
+                    "forecast": forecast.to_dict(),
+                    "comparison": comparison.to_dict() if comparison else None,
+                    "strategy_summary": strategy.summary if strategy else None,
+                }],
+                "query_time": datetime.now().isoformat(),
+            })
+        else:
+            return jsonify({
+                "status": "ok",
+                "total": 0,
+                "forecasts": [],
+                "message": f"日期 {date_str} 无电价预告记录",
+                "query_time": datetime.now().isoformat(),
+            })
+    else:
+        forecasts = price_forecast_manager.list_forecasts(limit)
+        result = []
+        for f in forecasts:
+            comparison = price_forecast_manager.get_comparison(f.forecast_id)
+            strategy = price_forecast_manager.get_strategy_by_forecast(f.forecast_id)
+            result.append({
+                "forecast": f.to_dict(),
+                "comparison": comparison.to_dict() if comparison else None,
+                "strategy_summary": strategy.summary if strategy else None,
+            })
+
+        return jsonify({
+            "status": "ok",
+            "total": len(result),
+            "forecasts": result,
+            "query_time": datetime.now().isoformat(),
+        })
+
+
+@app.route("/api/price-forecast/stats", methods=["GET"])
+def get_strategy_execution_stats():
+    """
+    查询策略执行效果统计
+    参数: start_date (可选), end_date (可选)
+    """
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+
+    if start_date:
+        try:
+            datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "start_date 格式必须为 YYYY-MM-DD"}), 400
+
+    if end_date:
+        try:
+            datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "end_date 格式必须为 YYYY-MM-DD"}), 400
+
+    stats = price_forecast_manager.get_execution_stats(start_date, end_date)
+
+    return jsonify({
+        "status": "ok",
+        "stats": stats.to_dict(),
+        "query_time": datetime.now().isoformat(),
+    })
+
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
+    active_forecast = price_forecast_manager.get_active_forecast()
     return jsonify({
         "status": "ok",
         "service": "电力微网调度与储能管理服务",
@@ -1488,6 +1731,8 @@ def health_check():
         "alert_count": len(state.alerts),
         "backup_plan_count": len(state.backup_plans),
         "fault_event_count": len(state.fault_events),
+        "price_forecast_active": active_forecast is not None,
+        "active_forecast_id": active_forecast.forecast_id if active_forecast else None,
     })
 
 
@@ -1557,6 +1802,13 @@ def _list_endpoints():
         "GET /api/simulation/simulations/<id>/report - 查询仿真报告",
         "GET /api/simulation/simulations/<id>/steps - 查询仿真逐步记录",
         "GET /api/simulation/compare - 对比两个仿真结果",
+        "POST /api/price-forecast/submit - 提交次日电价预告",
+        "GET /api/price-forecast/current - 查询当前生效的电价预告",
+        "GET /api/price-forecast/strategy - 查询策略建议详情",
+        "POST /api/price-forecast/activate - 激活电价策略",
+        "POST /api/price-forecast/deactivate - 停用电价策略",
+        "GET /api/price-forecast/history - 查询历史电价预告记录",
+        "GET /api/price-forecast/stats - 查询策略执行效果统计",
     ]
 
 
@@ -1580,6 +1832,14 @@ if __name__ == "__main__":
     print("  - 创建场景: POST /api/simulation/scenarios")
     print("  - 运行仿真: POST /api/simulation/run")
     print("  - 对比结果: GET /api/simulation/compare")
+    print("-" * 60)
+    print("电价预测与购电策略优化模块: 已启用")
+    print("  - 提交预告: POST /api/price-forecast/submit")
+    print("  - 当前策略: GET /api/price-forecast/current")
+    print("  - 策略详情: GET /api/price-forecast/strategy")
+    print("  - 激活策略: POST /api/price-forecast/activate")
+    print("  - 历史记录: GET /api/price-forecast/history")
+    print("  - 效果统计: GET /api/price-forecast/stats")
     print("=" * 60)
     print("服务地址: http://127.0.0.1:5001")
     print("健康检查: http://127.0.0.1:5001/api/health")
