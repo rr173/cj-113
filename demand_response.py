@@ -342,24 +342,48 @@ class DemandResponseManager:
                 started_events.append(event.event_id)
         return started_events
 
-    def get_active_event(self) -> Optional[DemandResponseEvent]:
-        now = datetime.now()
+    def get_active_event(self, now: datetime = None) -> Optional[DemandResponseEvent]:
+        if now is None:
+            now = datetime.now()
         for event in self.events.values():
             if event.status == "active" and event.start_time <= now <= event.end_time:
                 return event
+        for event in self.events.values():
+            if event.status == "active":
+                return None
         return None
 
     def get_current_reduction(self, now: datetime = None) -> Dict[str, Any]:
         if now is None:
             now = datetime.now()
 
-        active_event = self.get_active_event()
+        active_event = self.get_active_event(now)
         if not active_event or not active_event.current_plan_id:
-            return {"active": False, "load_reductions": {}, "battery_discharge_kw": 0.0, "target_load_kw": 0.0}
+            return {
+                "active": False,
+                "load_reductions": {},
+                "battery_discharge_kw": 0.0,
+                "target_load_kw": 0.0,
+                "debug_reason": "no_active_event",
+            }
 
         plan = self.plans.get(active_event.current_plan_id)
-        if not plan or not plan.schedule:
-            return {"active": False, "load_reductions": {}, "battery_discharge_kw": 0.0, "target_load_kw": 0.0}
+        if not plan:
+            return {
+                "active": False,
+                "load_reductions": {},
+                "battery_discharge_kw": 0.0,
+                "target_load_kw": 0.0,
+                "debug_reason": "plan_not_found",
+            }
+        if not plan.schedule:
+            return {
+                "active": False,
+                "load_reductions": {},
+                "battery_discharge_kw": 0.0,
+                "target_load_kw": 0.0,
+                "debug_reason": "plan_schedule_empty",
+            }
 
         current_period = None
         for period in plan.schedule:
@@ -367,8 +391,23 @@ class DemandResponseManager:
                 current_period = period
                 break
 
-        if not current_period:
-            return {"active": False, "load_reductions": {}, "battery_discharge_kw": 0.0, "target_load_kw": 0.0}
+        if current_period is None:
+            if now < plan.schedule[0].period_start:
+                current_period = plan.schedule[0]
+                debug_reason = "used_first_period"
+            elif now >= plan.schedule[-1].period_end:
+                current_period = plan.schedule[-1]
+                debug_reason = "used_last_period"
+            else:
+                min_diff = None
+                for period in plan.schedule:
+                    diff = abs((period.period_start - now).total_seconds())
+                    if min_diff is None or diff < min_diff:
+                        min_diff = diff
+                        current_period = period
+                debug_reason = "used_nearest_period"
+        else:
+            debug_reason = "exact_match"
 
         return {
             "active": True,
@@ -376,6 +415,7 @@ class DemandResponseManager:
             "target_load_kw": active_event.target_load_kw,
             "load_reductions": current_period.load_reductions,
             "battery_discharge_kw": current_period.battery_discharge_kw,
+            "debug_reason": debug_reason,
         }
 
     def record_execution(self, event_id: str, actual_load_kw: float,
@@ -545,26 +585,74 @@ class DemandResponseManager:
         if now is None:
             now = datetime.now()
 
-        active_event = self.get_active_event()
-        if not active_event:
+        active_events = [e for e in self.events.values() if e.status == "active"]
+        if not active_events:
             return decision
+
+        if len(active_events) > 0:
+            decision.notes.append(
+                f"[需求响应-调试] 检测到{len(active_events)}个active状态事件"
+            )
+            for e in active_events:
+                decision.notes.append(
+                    f"[需求响应-调试]   事件{e.event_id}: 时间[{e.start_time}~{e.end_time}], "
+                    f"目标{e.target_load_kw}kW, now={now}, "
+                    f"in_time_window={e.start_time <= now <= e.end_time}"
+                )
+
+        active_event = self.get_active_event(now)
+        if not active_event:
+            decision.notes.append("[需求响应-调试] 无事件满足时间窗口约束，跳过削减")
+            return decision
+
+        decision.notes.append(
+            f"[需求响应] 事件{active_event.event_id}生效中 "
+            f"(时间窗口: {active_event.start_time.strftime('%H:%M')}~{active_event.end_time.strftime('%H:%M')}, "
+            f"目标: {active_event.target_load_kw}kW)"
+        )
 
         dr_info = self.get_current_reduction(now)
+        debug_reason = dr_info.get("debug_reason", "unknown")
+
         if not dr_info.get("active"):
+            decision.notes.append(
+                f"[需求响应-调试] 方案不活跃 (原因: {debug_reason}), "
+                f"plan_id={active_event.current_plan_id}"
+            )
             return decision
 
+        decision.notes.append(f"[需求响应-调试] 方案时段匹配模式: {debug_reason}")
+
         target_load = dr_info["target_load_kw"]
-        total_reduction = sum(dr_info["load_reductions"].values())
-        battery_extra_discharge = dr_info["battery_discharge_kw"]
+        load_reductions = dr_info.get("load_reductions", {})
+        total_reduction = sum(load_reductions.values())
+        battery_extra_discharge = dr_info.get("battery_discharge_kw", 0.0)
 
         current_load = decision.load_served_kw
 
+        decision.notes.append(
+            f"[需求响应] 当前负荷{current_load:.2f}kW, "
+            f"需削减至{target_load:.2f}kW, "
+            f"计划削减{total_reduction:.2f}kW"
+            + (f"+电池{battery_extra_discharge:.2f}kW" if battery_extra_discharge > 0 else "")
+        )
+
+        reduction_details = []
+        for load_id, kw in load_reductions.items():
+            load = self.interruptible_loads.get(load_id)
+            name = load.name if load else load_id
+            reduction_details.append(f"{name} {kw:.1f}kW")
+        if reduction_details:
+            decision.notes.append(f"[需求响应] 削减明细: {', '.join(reduction_details)}")
+
         if current_load <= target_load:
-            decision.notes.append(f"[需求响应] 当前负荷{current_load:.2f}kW低于目标{target_load:.2f}kW，满足约束")
+            decision.notes.append(
+                f"[需求响应] 当前负荷{current_load:.2f}kW已低于目标{target_load:.2f}kW，满足约束"
+            )
             self.record_execution(
                 active_event.event_id,
                 current_load,
-                dr_info["load_reductions"],
+                load_reductions,
                 battery_extra_discharge,
                 now,
             )
@@ -573,14 +661,20 @@ class DemandResponseManager:
         load_after_reduction = current_load - total_reduction
 
         if load_after_reduction <= target_load:
+            actual_reduction = current_load - target_load
             decision.notes.append(
-                f"[需求响应] 削减负荷{total_reduction:.2f}kW，"
-                f"从{current_load:.2f}kW降至{load_after_reduction:.2f}kW，满足目标{target_load:.2f}kW"
+                f"[需求响应] 削减负荷{actual_reduction:.2f}kW，"
+                f"从{current_load:.2f}kW降至{target_load:.2f}kW，满足目标"
             )
-            decision.load_served_kw = load_after_reduction
-            decision.load_shed_kw += total_reduction
+            decision.load_served_kw = target_load
+            decision.load_shed_kw += actual_reduction
 
-            for load_id, reduction_kw in dr_info["load_reductions"].items():
+            applied_ratio = actual_reduction / total_reduction if total_reduction > 0 else 1.0
+            applied_reductions = {
+                lid: kw * applied_ratio for lid, kw in load_reductions.items()
+            }
+
+            for load_id, reduction_kw in applied_reductions.items():
                 load = self.interruptible_loads.get(load_id)
                 if load:
                     load.current_reduction_kw = reduction_kw
@@ -588,9 +682,9 @@ class DemandResponseManager:
 
             self.record_execution(
                 active_event.event_id,
-                load_after_reduction,
-                dr_info["load_reductions"],
-                battery_extra_discharge,
+                target_load,
+                applied_reductions,
+                0.0,
                 now,
             )
             return decision
@@ -598,7 +692,7 @@ class DemandResponseManager:
         load_after_reduction_and_battery = load_after_reduction - battery_extra_discharge
 
         if load_after_reduction_and_battery <= target_load:
-            extra_discharge_needed = current_load - total_reduction - target_load
+            extra_discharge_needed = load_after_reduction - target_load
             decision.notes.append(
                 f"[需求响应] 削减负荷{total_reduction:.2f}kW + 电池追加放电{extra_discharge_needed:.2f}kW，"
                 f"满足目标{target_load:.2f}kW"
@@ -610,7 +704,7 @@ class DemandResponseManager:
             current_discharge = decision.bess_action[bes_id].get("discharge_kw", 0.0)
             decision.bess_action[bes_id]["discharge_kw"] = current_discharge + extra_discharge_needed
 
-            for load_id, reduction_kw in dr_info["load_reductions"].items():
+            for load_id, reduction_kw in load_reductions.items():
                 load = self.interruptible_loads.get(load_id)
                 if load:
                     load.current_reduction_kw = reduction_kw
@@ -619,16 +713,17 @@ class DemandResponseManager:
             self.record_execution(
                 active_event.event_id,
                 target_load,
-                dr_info["load_reductions"],
+                load_reductions,
                 extra_discharge_needed,
                 now,
             )
             return decision
 
+        final_gap = target_load - load_after_reduction_and_battery
         decision.notes.append(
             f"[需求响应] 警告：最大可调节能力不足，"
             f"削减后负荷{load_after_reduction_and_battery:.2f}kW仍高于目标{target_load:.2f}kW，"
-            f"缺口{target_load - load_after_reduction_and_battery:.2f}kW"
+            f"缺口{abs(final_gap):.2f}kW"
         )
         decision.load_served_kw = load_after_reduction_and_battery
         decision.load_shed_kw += total_reduction
@@ -637,7 +732,7 @@ class DemandResponseManager:
         current_discharge = decision.bess_action[bes_id].get("discharge_kw", 0.0)
         decision.bess_action[bes_id]["discharge_kw"] = current_discharge + battery_extra_discharge
 
-        for load_id, reduction_kw in dr_info["load_reductions"].items():
+        for load_id, reduction_kw in load_reductions.items():
             load = self.interruptible_loads.get(load_id)
             if load:
                 load.current_reduction_kw = reduction_kw
@@ -646,7 +741,7 @@ class DemandResponseManager:
         self.record_execution(
             active_event.event_id,
             load_after_reduction_and_battery,
-            dr_info["load_reductions"],
+            load_reductions,
             battery_extra_discharge,
             now,
         )

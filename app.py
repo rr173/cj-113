@@ -1030,8 +1030,9 @@ def get_dr_stats():
 
 @app.route("/api/dr/current", methods=["GET"])
 def get_current_dr_status():
-    dr_info = dr_manager.get_current_reduction()
-    active_event = dr_manager.get_active_event()
+    now = datetime.now()
+    dr_info = dr_manager.get_current_reduction(now)
+    active_event = dr_manager.get_active_event(now)
 
     load_details = []
     for load_id, reduction_kw in dr_info.get("load_reductions", {}).items():
@@ -1040,6 +1041,18 @@ def get_current_dr_status():
             "load_id": load_id,
             "name": load.name if load else load_id,
             "reduction_kw": reduction_kw,
+        })
+
+    all_active_events = [e for e in dr_manager.events.values() if e.status == "active"]
+    active_event_details = []
+    for e in all_active_events:
+        active_event_details.append({
+            "event_id": e.event_id,
+            "event_no": e.event_no,
+            "start_time": e.start_time.isoformat(),
+            "end_time": e.end_time.isoformat(),
+            "target_load_kw": e.target_load_kw,
+            "in_time_window": e.start_time <= now <= e.end_time,
         })
 
     return jsonify({
@@ -1053,22 +1066,29 @@ def get_current_dr_status():
             "total_reduction_kw": sum(dr_info.get("load_reductions", {}).values()) + dr_info.get("battery_discharge_kw", 0),
             "load_reductions": load_details,
             "battery_discharge_kw": dr_info.get("battery_discharge_kw", 0),
+            "debug_reason": dr_info.get("debug_reason"),
         },
-        "query_time": datetime.now().isoformat(),
+        "debug": {
+            "now": now.isoformat(),
+            "all_active_events": active_event_details,
+            "active_event_count": len(all_active_events),
+        },
+        "query_time": now.isoformat(),
     })
 
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
+    now = datetime.now()
     return jsonify({
         "status": "ok",
         "service": "电力微网调度与储能管理服务",
-        "time": datetime.now().isoformat(),
+        "time": now.isoformat(),
         "sources_reported": _get_awaiting(),
         "dispatch_count": len(state.dispatch_history),
         "alert_count": len(state.alerts),
         "dr_event_count": len(dr_manager.events),
-        "dr_active_event": dr_manager.get_active_event() is not None,
+        "dr_active_event": dr_manager.get_active_event(now) is not None,
     })
 
 
