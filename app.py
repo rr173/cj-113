@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from typing import Optional
 from flask import Flask, request, jsonify
 from dataclasses import asdict
 
@@ -128,6 +129,17 @@ def _audit_to_dict_detail(audit):
     }
 
 
+def _parse_bool_param(param_str: Optional[str]) -> Optional[bool]:
+    if param_str is None:
+        return None
+    lower_val = param_str.lower()
+    if lower_val in ("true", "1", "yes", "y"):
+        return True
+    elif lower_val in ("false", "0", "no", "n"):
+        return False
+    return None
+
+
 @app.route("/api/audit/logs", methods=["GET"])
 def get_audit_logs():
     """
@@ -136,9 +148,9 @@ def get_audit_logs():
       - start_time: 开始时间 (ISO格式，可选)
       - end_time: 结束时间 (ISO格式，可选)
       - min_cost: 最低决策成本阈值 (可选)
-      - has_load_shed: 是否只看甩负荷的 (true/false，可选)
-      - has_diesel_start: 是否只看启动柴油机的 (true/false，可选)
-      - has_anomaly: 是否只看异常的 (true/false，可选)
+      - has_load_shed / load_shed: 是否只看甩负荷的 (true/false，可选)
+      - has_diesel_start / diesel_start: 是否只看启动柴油机的 (true/false，可选)
+      - has_anomaly / anomaly_only: 是否只看异常的 (true/false，可选)
       - limit: 返回数量限制 (默认50)
       - offset: 分页偏移 (默认0)
     """
@@ -146,9 +158,9 @@ def get_audit_logs():
         start_time_str = request.args.get("start_time")
         end_time_str = request.args.get("end_time")
         min_cost_str = request.args.get("min_cost")
-        has_load_shed_str = request.args.get("has_load_shed")
-        has_diesel_start_str = request.args.get("has_diesel_start")
-        has_anomaly_str = request.args.get("has_anomaly")
+        has_load_shed_str = request.args.get("has_load_shed") or request.args.get("load_shed")
+        has_diesel_start_str = request.args.get("has_diesel_start") or request.args.get("diesel_start")
+        has_anomaly_str = request.args.get("has_anomaly") or request.args.get("anomaly_only")
         limit = int(request.args.get("limit", 50))
         offset = int(request.args.get("offset", 0))
 
@@ -156,17 +168,9 @@ def get_audit_logs():
         end_time = datetime.fromisoformat(end_time_str) if end_time_str else None
         min_cost = float(min_cost_str) if min_cost_str else None
 
-        has_load_shed = None
-        if has_load_shed_str is not None:
-            has_load_shed = has_load_shed_str.lower() == "true"
-
-        has_diesel_start = None
-        if has_diesel_start_str is not None:
-            has_diesel_start = has_diesel_start_str.lower() == "true"
-
-        has_anomaly = None
-        if has_anomaly_str is not None:
-            has_anomaly = has_anomaly_str.lower() == "true"
+        has_load_shed = _parse_bool_param(has_load_shed_str)
+        has_diesel_start = _parse_bool_param(has_diesel_start_str)
+        has_anomaly = _parse_bool_param(has_anomaly_str)
 
         logs = state.query_audit_logs(
             start_time=start_time,
@@ -197,6 +201,14 @@ def get_audit_logs():
             "returned": len(logs),
             "limit": limit,
             "offset": offset,
+            "filters": {
+                "start_time": start_time_str,
+                "end_time": end_time_str,
+                "min_cost": min_cost_str,
+                "has_load_shed": has_load_shed,
+                "has_diesel_start": has_diesel_start,
+                "has_anomaly": has_anomaly,
+            },
             "logs": [_audit_to_dict_brief(log) for log in logs],
         })
     except ValueError as e:

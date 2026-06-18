@@ -155,31 +155,31 @@ class AnomalyDetector:
         return anomalies
 
     def _check_cost_volatility(self, audit_log: AuditLog) -> Optional[AnomalyMarker]:
-        history = self.state.dispatch_history
-        if len(history) < 2:
+        if len(self.state.audit_logs) < 1:
             return None
 
         current_cost = audit_log.output_summary.total_cost
         current_hour = audit_log.input_snapshot.hour
 
         prev_same_hour = None
-        for d in reversed(history[:-1]):
-            if d.timestamp.hour == current_hour and d.timestamp.date() == audit_log.timestamp.date():
-                prev_same_hour = d
+        for log in reversed(self.state.audit_logs):
+            if log.input_snapshot.hour == current_hour and log.timestamp.date() == audit_log.timestamp.date():
+                prev_same_hour = log
                 break
 
-        if prev_same_hour is None or prev_same_hour.cost <= 0:
+        if prev_same_hour is None or prev_same_hour.output_summary.total_cost <= 0:
             return None
 
-        ratio = current_cost / prev_same_hour.cost
+        prev_cost = prev_same_hour.output_summary.total_cost
+        ratio = current_cost / prev_cost
         if ratio >= 2.0:
             return AnomalyMarker(
                 anomaly_type="COST_VOLATILITY",
                 severity="high",
-                description=f"当前小时成本波动异常，成本({current_cost:.2f}元)是上一小时同时段({prev_same_hour.cost:.2f}元)的{ratio:.1f}倍",
+                description=f"当前小时成本波动异常，成本({current_cost:.2f}元)是上一次同时段({prev_cost:.2f}元)的{ratio:.1f}倍",
                 details={
                     "current_cost": current_cost,
-                    "previous_cost": prev_same_hour.cost,
+                    "previous_cost": prev_cost,
                     "ratio": round(ratio, 2),
                     "threshold": 2.0,
                 },
@@ -190,11 +190,10 @@ class AnomalyDetector:
         if audit_log.output_summary.load_shed_kw <= 0:
             return None
 
-        history = self.state.dispatch_history
-        consecutive_count = 0
+        consecutive_count = 1
 
-        for d in reversed(history):
-            if d.load_shed_kw > 0:
+        for log in reversed(self.state.audit_logs):
+            if log.output_summary.load_shed_kw > 0:
                 consecutive_count += 1
             else:
                 break
@@ -208,6 +207,7 @@ class AnomalyDetector:
                     "consecutive_count": consecutive_count,
                     "current_shed_kw": audit_log.output_summary.load_shed_kw,
                     "threshold": 3,
+                    "note": "连续次数从审计功能启用后开始计数",
                 },
             )
         return None

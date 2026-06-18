@@ -270,10 +270,29 @@ class TestAnomalyDetector:
         now = datetime.now()
 
         for i in range(4, -1, -1):
-            decision = MagicMock()
-            decision.load_shed_kw = 50.0 if i < 4 else 0.0
-            decision.timestamp = now - timedelta(minutes=i)
-            state.dispatch_history.append(decision)
+            summary = OutputSummary(
+                load_served_kw=250.0, load_shed_kw=50.0 if i < 4 else 0.0,
+                load_coverage_ratio=0.833, total_cost=100.0,
+                pv_share_kw=100.0, wt_share_kw=50.0, diesel_share_kw=50.0,
+                bess_discharge_kw=50.0, grid_import_kw=0.0, grid_export_kw=0.0
+            )
+            snapshot = InputSnapshot(
+                pv_output={}, wt_output={}, diesel_available={},
+                load_kw=300.0, bess_soc={}, grid_buy_price=0.8,
+                feed_in_price=0.3, tariff_period="flat", hour=14,
+                storage_strategy_active=True, storage_mode="normal",
+                demand_response_active=False, active_backup_plans=[],
+                source_health_status={}
+            )
+            audit = AuditLog(
+                audit_id=f"AUDIT-{1000+i:08d}",
+                dispatch_id=f"DISP-{1000+i:08d}",
+                timestamp=now - timedelta(minutes=i),
+                input_snapshot=snapshot,
+                decision_branches=[],
+                output_summary=summary
+            )
+            state.audit_logs.append(audit)
 
         detector = AnomalyDetector(state)
 
