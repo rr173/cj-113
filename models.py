@@ -168,6 +168,149 @@ class AccumulatedStats:
     load_grid_import_kwh: float = 0.0
 
 
+@dataclass
+class PriceForecastRecord:
+    forecast_id: str
+    forecast_date: str
+    prices: List[float]
+    submitted_at: datetime
+    status: str = "pending"
+    activated_at: Optional[datetime] = None
+    deactivated_at: Optional[datetime] = None
+
+
+@dataclass
+class PriceComparisonHour:
+    hour: int
+    forecast_price: float
+    fixed_price: float
+    fixed_period: str
+    price_diff: float
+    price_diff_ratio: float
+    is_valley_opportunity: bool
+    is_peak_risk: bool
+
+
+@dataclass
+class PriceComparisonResult:
+    forecast_id: str
+    forecast_date: str
+    hours: List[PriceComparisonHour]
+    valley_opportunity_hours: List[int]
+    peak_risk_hours: List[int]
+    total_valley_savings_potential: float
+    total_peak_risk_cost: float
+    valley_price_threshold: float
+    peak_price_threshold: float
+
+
+@dataclass
+class StrategySuggestionHour:
+    hour: int
+    suggested_action: str
+    reason: str
+    forecast_price: float
+    fixed_price: float
+
+
+@dataclass
+class PurchaseStrategy:
+    strategy_id: str
+    forecast_id: str
+    forecast_date: str
+    generated_at: datetime
+    status: str
+    hours: List[StrategySuggestionHour]
+    summary: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StrategyExecutionDayStats:
+    date: str
+    strategy_used: bool
+    strategy_id: Optional[str]
+    avg_buy_price: float
+    total_grid_import_kwh: float
+    total_buy_cost: float
+    total_load_served_kwh: float
+    total_load_shed_kwh: float = 0.0
+
+
+@dataclass
+class StrategyExecutionStatsSummary:
+    strategy_days: int
+    no_strategy_days: int
+    avg_cost_with_strategy: float
+    avg_cost_without_strategy: float
+    cost_saving_ratio: float
+    total_saving: float
+    details: List[StrategyExecutionDayStats] = field(default_factory=list)
+
+
+@dataclass
+class InputSnapshot:
+    pv_output: Dict[str, float]
+    wt_output: Dict[str, float]
+    diesel_available: Dict[str, bool]
+    load_kw: float
+    bess_soc: Dict[str, float]
+    grid_buy_price: float
+    feed_in_price: float
+    tariff_period: str
+    hour: int
+    storage_strategy_active: bool
+    storage_mode: str
+    demand_response_active: bool
+    active_backup_plans: List[str]
+    source_health_status: Dict[str, str]
+
+
+@dataclass
+class DecisionBranch:
+    branch_name: str
+    decision: bool
+    reason: str
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OutputSummary:
+    load_served_kw: float
+    load_shed_kw: float
+    load_coverage_ratio: float
+    total_cost: float
+    pv_share_kw: float
+    wt_share_kw: float
+    diesel_share_kw: float
+    bess_discharge_kw: float
+    grid_import_kw: float
+    grid_export_kw: float
+    cost_breakdown: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class AnomalyMarker:
+    anomaly_type: str
+    severity: str
+    description: str
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AuditLog:
+    audit_id: str
+    dispatch_id: str
+    timestamp: datetime
+    input_snapshot: InputSnapshot
+    decision_branches: List[DecisionBranch]
+    output_summary: OutputSummary
+    anomalies: List[AnomalyMarker] = field(default_factory=list)
+    reasoning_chain: List[str] = field(default_factory=list)
+
+    def has_anomaly(self) -> bool:
+        return len(self.anomalies) > 0
+
+
 class MicrogridState:
     HEALTH_WINDOW_SIZE = 50
     HEALTH_WARNING_THRESHOLD = 60.0
@@ -217,6 +360,10 @@ class MicrogridState:
         self.fault_events: List[FaultEvent] = []
         self._fault_event_counter: int = 0
         self._backup_plan_counter: int = 0
+
+        self.audit_logs: List[AuditLog] = []
+        self._audit_counter: int = 0
+        self._dispatch_counter: int = 0
 
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
@@ -1019,419 +1166,70 @@ class MicrogridState:
             })
         return result
 
+    def generate_dispatch_id(self) -> str:
+        self._dispatch_counter += 1
+        return f"DISP-{self._dispatch_counter:08d}"
 
-@dataclass
-class TimeSeriesSegment:
-    start_minute: int
-    end_minute: int
-    value_kw: float
+    def generate_audit_id(self) -> str:
+        self._audit_counter += 1
+        return f"AUDIT-{self._audit_counter:08d}"
 
+    def add_audit_log(self, audit_log: AuditLog):
+        self.audit_logs.append(audit_log)
 
-@dataclass
-class SourceTimeSeries:
-    source_id: str
-    source_type: str
-    segments: List[TimeSeriesSegment] = field(default_factory=list)
+    def get_audit_log(self, audit_id: str) -> Optional[AuditLog]:
+        for log in self.audit_logs:
+            if log.audit_id == audit_id:
+                return log
+        return None
 
+    def get_audit_log_by_dispatch_id(self, dispatch_id: str) -> Optional[AuditLog]:
+        for log in self.audit_logs:
+            if log.dispatch_id == dispatch_id:
+                return log
+        return None
 
-@dataclass
-class LoadTimeSeries:
-    segments: List[TimeSeriesSegment] = field(default_factory=list)
+    def query_audit_logs(self,
+                         start_time: Optional[datetime] = None,
+                         end_time: Optional[datetime] = None,
+                         min_cost: Optional[float] = None,
+                         has_load_shed: Optional[bool] = None,
+                         has_diesel_start: Optional[bool] = None,
+                         has_anomaly: Optional[bool] = None,
+                         limit: int = 50,
+                         offset: int = 0) -> List[AuditLog]:
+        result = []
+        for log in self.audit_logs:
+            if start_time and log.timestamp < start_time:
+                continue
+            if end_time and log.timestamp > end_time:
+                continue
+            if min_cost is not None and log.output_summary.total_cost < min_cost:
+                continue
+            if has_load_shed is not None:
+                if has_load_shed and log.output_summary.load_shed_kw <= 0:
+                    continue
+                if not has_load_shed and log.output_summary.load_shed_kw > 0:
+                    continue
+            if has_diesel_start is not None:
+                if has_diesel_start and log.output_summary.diesel_share_kw <= 0:
+                    continue
+                if not has_diesel_start and log.output_summary.diesel_share_kw > 0:
+                    continue
+            if has_anomaly is not None:
+                if has_anomaly and not log.has_anomaly():
+                    continue
+                if not has_anomaly and log.has_anomaly():
+                    continue
+            result.append(log)
 
+        result = list(reversed(result))
+        total = len(result)
+        start_idx = offset
+        end_idx = min(offset + limit, total)
+        return result[start_idx:end_idx]
 
-@dataclass
-class SimulationScenario:
-    scenario_id: str
-    name: str
-    description: str = ""
-    duration_hours: int = 24
-    time_step_minutes: int = 1
-    pv_series: Dict[str, SourceTimeSeries] = field(default_factory=dict)
-    wt_series: Dict[str, SourceTimeSeries] = field(default_factory=dict)
-    diesel_available: Dict[str, bool] = field(default_factory=dict)
-    load_series: LoadTimeSeries = field(default_factory=LoadTimeSeries)
-    initial_soc_override: Dict[str, float] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=datetime.now)
-    updated_at: datetime = field(default_factory=datetime.now)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "scenario_id": self.scenario_id,
-            "name": self.name,
-            "description": self.description,
-            "duration_hours": self.duration_hours,
-            "time_step_minutes": self.time_step_minutes,
-            "pv_series": {
-                sid: {
-                    "source_id": s.source_id,
-                    "source_type": s.source_type,
-                    "segments": [
-                        {"start_minute": seg.start_minute, "end_minute": seg.end_minute, "value_kw": seg.value_kw}
-                        for seg in s.segments
-                    ]
-                }
-                for sid, s in self.pv_series.items()
-            },
-            "wt_series": {
-                sid: {
-                    "source_id": s.source_id,
-                    "source_type": s.source_type,
-                    "segments": [
-                        {"start_minute": seg.start_minute, "end_minute": seg.end_minute, "value_kw": seg.value_kw}
-                        for seg in s.segments
-                    ]
-                }
-                for sid, s in self.wt_series.items()
-            },
-            "diesel_available": self.diesel_available,
-            "load_series": {
-                "segments": [
-                    {"start_minute": seg.start_minute, "end_minute": seg.end_minute, "value_kw": seg.value_kw}
-                    for seg in self.load_series.segments
-                ]
-            },
-            "initial_soc_override": self.initial_soc_override,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
-        }
-
-
-class SimulationStatus:
-    NOT_RUN = "not_run"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-@dataclass
-class SimulationStepRecord:
-    step_index: int
-    simulation_time: datetime
-    scenario_minute: int
-    pv_output: Dict[str, float]
-    wt_output: Dict[str, float]
-    diesel_output: Dict[str, float]
-    bess_soc_before: Dict[str, float]
-    bess_soc_after: Dict[str, float]
-    bess_charge_kw: Dict[str, float]
-    bess_discharge_kw: Dict[str, float]
-    grid_import_kw: float
-    grid_export_kw: float
-    load_served_kw: float
-    load_shed_kw: float
-    step_cost: float
-    tariff_period: str
-    notes: List[str] = field(default_factory=list)
-
-
-@dataclass
-class SimulationReport:
-    simulation_id: str
-    scenario_id: str
-    scenario_name: str
-    status: str
-    total_steps: int = 0
-    completed_steps: int = 0
-    start_time: Optional[datetime] = None
-    end_time: Optional[datetime] = None
-    error_message: Optional[str] = None
-    total_cost: float = 0.0
-    total_grid_import_kwh: float = 0.0
-    total_grid_export_kwh: float = 0.0
-    peak_grid_import_kwh: float = 0.0
-    total_diesel_generated_kwh: float = 0.0
-    total_diesel_starts: int = 0
-    total_bess_charge_kwh: Dict[str, float] = field(default_factory=dict)
-    total_bess_discharge_kwh: Dict[str, float] = field(default_factory=dict)
-    total_load_shed_kwh: float = 0.0
-    initial_soc: Dict[str, float] = field(default_factory=dict)
-    final_soc: Dict[str, float] = field(default_factory=dict)
-    cost_curve: List[Dict[str, Any]] = field(default_factory=list)
-    soc_curve: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
-    step_records: List[SimulationStepRecord] = field(default_factory=list)
-
-    def to_dict(self, include_steps: bool = False) -> Dict[str, Any]:
-        result = {
-            "simulation_id": self.simulation_id,
-            "scenario_id": self.scenario_id,
-            "scenario_name": self.scenario_name,
-            "status": self.status,
-            "total_steps": self.total_steps,
-            "completed_steps": self.completed_steps,
-            "start_time": self.start_time.isoformat() if self.start_time else None,
-            "end_time": self.end_time.isoformat() if self.end_time else None,
-            "error_message": self.error_message,
-            "summary": {
-                "total_cost": round(self.total_cost, 4),
-                "total_grid_import_kwh": round(self.total_grid_import_kwh, 4),
-                "total_grid_export_kwh": round(self.total_grid_export_kwh, 4),
-                "peak_grid_import_kwh": round(self.peak_grid_import_kwh, 4),
-                "peak_import_ratio": round(
-                    self.peak_grid_import_kwh / self.total_grid_import_kwh if self.total_grid_import_kwh > 0 else 0.0,
-                    4
-                ),
-                "total_diesel_generated_kwh": round(self.total_diesel_generated_kwh, 4),
-                "total_diesel_starts": self.total_diesel_starts,
-                "total_bess_charge_kwh": {k: round(v, 4) for k, v in self.total_bess_charge_kwh.items()},
-                "total_bess_discharge_kwh": {k: round(v, 4) for k, v in self.total_bess_discharge_kwh.items()},
-                "bess_cycles_approx": {
-                    k: round(v / 500.0, 4) for k, v in self.total_bess_discharge_kwh.items()
-                },
-                "total_load_shed_kwh": round(self.total_load_shed_kwh, 4),
-                "initial_soc": {k: round(v * 100, 2) for k, v in self.initial_soc.items()},
-                "final_soc": {k: round(v * 100, 2) for k, v in self.final_soc.items()},
-            },
-            "cost_curve": self.cost_curve,
-            "soc_curve": self.soc_curve,
-        }
-        if include_steps:
-            result["step_records"] = [
-                {
-                    "step_index": s.step_index,
-                    "simulation_time": s.simulation_time.isoformat(),
-                    "scenario_minute": s.scenario_minute,
-                    "pv_output": s.pv_output,
-                    "wt_output": s.wt_output,
-                    "diesel_output": s.diesel_output,
-                    "bess_soc_before": {k: round(v * 100, 2) for k, v in s.bess_soc_before.items()},
-                    "bess_soc_after": {k: round(v * 100, 2) for k, v in s.bess_soc_after.items()},
-                    "bess_charge_kw": s.bess_charge_kw,
-                    "bess_discharge_kw": s.bess_discharge_kw,
-                    "grid_import_kw": s.grid_import_kw,
-                    "grid_export_kw": s.grid_export_kw,
-                    "load_served_kw": s.load_served_kw,
-                    "load_shed_kw": s.load_shed_kw,
-                    "step_cost": round(s.step_cost, 4),
-                    "tariff_period": s.tariff_period,
-                    "notes": s.notes,
-                }
-                for s in self.step_records
-            ]
-        return result
-
-
-@dataclass
-class SimulationComparisonReport:
-    simulation_a_id: str
-    simulation_b_id: str
-    scenario_a_name: str
-    scenario_b_name: str
-    cost_diff: float = 0.0
-    grid_import_diff: float = 0.0
-    grid_export_diff: float = 0.0
-    diesel_starts_diff: int = 0
-    diesel_generated_diff: float = 0.0
-    bess_cycles_diff: Dict[str, float] = field(default_factory=dict)
-    bess_charge_diff: Dict[str, float] = field(default_factory=dict)
-    bess_discharge_diff: Dict[str, float] = field(default_factory=dict)
-    load_shed_diff: float = 0.0
-    final_soc_diff: Dict[str, float] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "simulation_a_id": self.simulation_a_id,
-            "simulation_b_id": self.simulation_b_id,
-            "scenario_a_name": self.scenario_a_name,
-            "scenario_b_name": self.scenario_b_name,
-            "differences": {
-                "total_cost": {
-                    "a_minus_b": round(self.cost_diff, 4),
-                    "percent_change": round((self.cost_diff / abs(self.cost_diff - self.cost_diff + 1e-9)) * 0, 4),
-                },
-                "grid_import_kwh": round(self.grid_import_diff, 4),
-                "grid_export_kwh": round(self.grid_export_diff, 4),
-                "diesel_starts": self.diesel_starts_diff,
-                "diesel_generated_kwh": round(self.diesel_generated_diff, 4),
-                "bess_cycles_approx": {k: round(v, 4) for k, v in self.bess_cycles_diff.items()},
-                "bess_charge_kwh": {k: round(v, 4) for k, v in self.bess_charge_diff.items()},
-                "bess_discharge_kwh": {k: round(v, 4) for k, v in self.bess_discharge_diff.items()},
-                "load_shed_kwh": round(self.load_shed_diff, 4),
-                "final_soc_percent": {k: round(v * 100, 2) for k, v in self.final_soc_diff.items()},
-            }
-        }
-
-
-@dataclass
-class PriceForecastRecord:
-    forecast_id: str
-    forecast_date: str
-    prices: List[float]
-    submitted_at: datetime
-    status: str = "pending"
-    activated_at: Optional[datetime] = None
-    deactivated_at: Optional[datetime] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "forecast_id": self.forecast_id,
-            "forecast_date": self.forecast_date,
-            "prices": [round(p, 4) for p in self.prices],
-            "submitted_at": self.submitted_at.isoformat(),
-            "status": self.status,
-            "status_chinese": {
-                "pending": "待激活",
-                "active": "已激活",
-                "expired": "已过期",
-                "deactivated": "已停用",
-            }.get(self.status, self.status),
-            "activated_at": self.activated_at.isoformat() if self.activated_at else None,
-            "deactivated_at": self.deactivated_at.isoformat() if self.deactivated_at else None,
-        }
-
-
-@dataclass
-class PriceComparisonHour:
-    hour: int
-    forecast_price: float
-    fixed_price: float
-    fixed_period: str
-    price_diff: float
-    price_diff_ratio: float
-    is_valley_opportunity: bool
-    is_peak_risk: bool
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "hour": self.hour,
-            "forecast_price": round(self.forecast_price, 4),
-            "fixed_price": round(self.fixed_price, 4),
-            "fixed_period": self.fixed_period,
-            "fixed_period_chinese": {
-                "valley": "谷时段",
-                "flat": "平时段",
-                "peak": "峰时段",
-            }.get(self.fixed_period, "未知"),
-            "price_diff": round(self.price_diff, 4),
-            "price_diff_ratio": round(self.price_diff_ratio, 4),
-            "is_valley_opportunity": self.is_valley_opportunity,
-            "is_peak_risk": self.is_peak_risk,
-        }
-
-
-@dataclass
-class PriceComparisonResult:
-    forecast_id: str
-    forecast_date: str
-    hours: List[PriceComparisonHour]
-    valley_opportunity_hours: List[int]
-    peak_risk_hours: List[int]
-    total_valley_savings_potential: float
-    total_peak_risk_cost: float
-    valley_price_threshold: float
-    peak_price_threshold: float
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "forecast_id": self.forecast_id,
-            "forecast_date": self.forecast_date,
-            "hours": [h.to_dict() for h in self.hours],
-            "valley_opportunity_hours": self.valley_opportunity_hours,
-            "peak_risk_hours": self.peak_risk_hours,
-            "valley_opportunity_count": len(self.valley_opportunity_hours),
-            "peak_risk_count": len(self.peak_risk_hours),
-            "total_valley_savings_potential": round(self.total_valley_savings_potential, 4),
-            "total_peak_risk_cost": round(self.total_peak_risk_cost, 4),
-            "valley_price_threshold": round(self.valley_price_threshold, 4),
-            "peak_price_threshold": round(self.peak_price_threshold, 4),
-        }
-
-
-@dataclass
-class StrategySuggestionHour:
-    hour: int
-    suggested_action: str
-    reason: str
-    forecast_price: float
-    fixed_price: float
-    target_soc: Optional[float] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "hour": self.hour,
-            "suggested_action": self.suggested_action,
-            "suggested_action_chinese": {
-                "active_charge": "主动充电",
-                "priority_discharge": "优先放电",
-                "force_discharge_no_grid": "强制放电禁止购电",
-                "normal": "常规模式",
-            }.get(self.suggested_action, self.suggested_action),
-            "reason": self.reason,
-            "forecast_price": round(self.forecast_price, 4),
-            "fixed_price": round(self.fixed_price, 4),
-            "target_soc": round(self.target_soc, 4) if self.target_soc is not None else None,
-        }
-
-
-@dataclass
-class PurchaseStrategy:
-    strategy_id: str
-    forecast_id: str
-    forecast_date: str
-    generated_at: datetime
-    status: str
-    hours: List[StrategySuggestionHour]
-    summary: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "strategy_id": self.strategy_id,
-            "forecast_id": self.forecast_id,
-            "forecast_date": self.forecast_date,
-            "generated_at": self.generated_at.isoformat(),
-            "status": self.status,
-            "status_chinese": {
-                "pending": "待激活",
-                "active": "已激活",
-                "expired": "已过期",
-                "deactivated": "已停用",
-            }.get(self.status, self.status),
-            "hours": [h.to_dict() for h in self.hours],
-            "summary": self.summary,
-        }
-
-
-@dataclass
-class StrategyExecutionDayStats:
-    date: str
-    strategy_used: bool
-    strategy_id: Optional[str]
-    avg_buy_price: float
-    total_grid_import_kwh: float
-    total_buy_cost: float
-    total_load_served_kwh: float
-    total_load_shed_kwh: float = 0.0
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "date": self.date,
-            "strategy_used": self.strategy_used,
-            "strategy_id": self.strategy_id,
-            "avg_buy_price": round(self.avg_buy_price, 4),
-            "total_grid_import_kwh": round(self.total_grid_import_kwh, 4),
-            "total_buy_cost": round(self.total_buy_cost, 4),
-            "total_load_served_kwh": round(self.total_load_served_kwh, 4),
-            "total_load_shed_kwh": round(self.total_load_shed_kwh, 4),
-        }
-
-
-@dataclass
-class StrategyExecutionStatsSummary:
-    strategy_days: int
-    no_strategy_days: int
-    avg_cost_with_strategy: float
-    avg_cost_without_strategy: float
-    cost_saving_ratio: float
-    total_saving: float
-    details: List[StrategyExecutionDayStats] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "strategy_days": self.strategy_days,
-            "no_strategy_days": self.no_strategy_days,
-            "avg_cost_with_strategy": round(self.avg_cost_with_strategy, 4),
-            "avg_cost_without_strategy": round(self.avg_cost_without_strategy, 4),
-            "cost_saving_ratio": round(self.cost_saving_ratio, 4),
-            "cost_saving_ratio_percent": f"{self.cost_saving_ratio * 100:.2f}%",
-            "total_saving": round(self.total_saving, 4),
-            "details": [d.to_dict() for d in self.details],
-        }
+    def get_anomaly_audit_logs(self, limit: int = 50) -> List[AuditLog]:
+        anomalies = [log for log in self.audit_logs if log.has_anomaly()]
+        anomalies = list(reversed(anomalies))
+        return anomalies[:limit]
