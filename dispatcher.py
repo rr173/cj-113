@@ -119,24 +119,97 @@ class DispatchEngine:
 
         remaining_load = load_kw - total_renewable
 
-        if storage_mode == "active_charge":
-            if force_discharge_no_grid:
-                cfg_b = config.BESS_CONFIG[bes_id]
-                base_max_discharge = self.state.get_bess_max_discharge(bes_id, time_interval_hours)
-                max_discharge = base_max_discharge
+        if force_discharge_no_grid:
+            cfg_b = config.BESS_CONFIG[bes_id]
+            base_max_discharge = self.state.get_bess_max_discharge(bes_id, time_interval_hours)
+            max_discharge = base_max_discharge
 
-                discharge_kw = min(remaining_load, max_discharge)
-                if discharge_kw > 0:
-                    bess_action[bes_id]["discharge_kw"] = discharge_kw
-                    remaining_load -= discharge_kw
-                    saved_cost = discharge_kw * time_interval_hours * grid_buy_price
-                    arbitrage_discharge_kwh += discharge_kw * time_interval_hours
-                    arbitrage_discharge_revenue += saved_cost
-                    notes.append(f"[强制放电] 高价时段电池放电 {discharge_kw:.2f}kW (避免高价购电，等效收益 {saved_cost:.4f}元)")
+            discharge_kw = min(remaining_load, max_discharge) if remaining_load > 0 else 0.0
+            if discharge_kw > 0:
+                bess_action[bes_id]["discharge_kw"] = discharge_kw
+                remaining_load -= discharge_kw
+                saved_cost = discharge_kw * time_interval_hours * grid_buy_price
+                arbitrage_discharge_kwh += discharge_kw * time_interval_hours
+                arbitrage_discharge_revenue += saved_cost
+                notes.append(f"[强制放电] 高价时段电池放电 {discharge_kw:.2f}kW (避免高价购电，等效收益 {saved_cost:.4f}元)")
 
-                if remaining_load > 0:
-                    diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
-                    if diesel_cap["can_run"] and diesel_gen_cost < grid_buy_price:
+            if remaining_load > 0:
+                diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
+                if diesel_cap["can_run"] and diesel_gen_cost < grid_buy_price:
+                    diesel_kw = min(remaining_load, diesel_cap["max_output"])
+                    diesel_output[ds_id] = diesel_kw
+                    remaining_load -= diesel_kw
+                    self.state.diesel_state[ds_id].output_kw = diesel_kw
+                    total_cost += diesel_kw * time_interval_hours * diesel_gen_cost
+                    if diesel_cap.get("startup_cost_applies"):
+                        startup_cost = config.DIESEL_CONFIG[ds_id]["startup_cost"]
+                        total_cost += startup_cost
+                        self.state.start_diesel(ds_id, now)
+                        notes.append(f"启动柴油机 (固定成本 {startup_cost}元)，出力 {diesel_kw:.2f}kW")
+                    else:
+                        notes.append(f"柴油机恢复/持续运行，出力 {diesel_kw:.2f}kW")
+
+            if remaining_load > 0:
+                load_shed_kw = remaining_load
+                total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
+                self.state.add_alert(
+                    "LOAD_SHEDDING",
+                    f"高价风险时段负荷缺口 {load_shed_kw:.2f}kW，禁止购电，执行甩负荷",
+                    {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw,
+                     "reason": "force_discharge_no_grid"}
+                )
+                notes.append(f"警告：高价风险时段，禁止购电，甩负荷 {load_shed_kw:.2f}kW")
+
+            if remaining_load < 0:
+                surplus = -remaining_load
+                max_charge = self.state.get_bess_max_charge_with_health(bes_id, time_interval_hours)
+                charge_kw = min(surplus, max_charge)
+                if charge_kw > 0:
+                    bess_action[bes_id]["charge_kw"] = charge_kw
+                    surplus -= charge_kw
+                    notes.append(f"电池充电 {charge_kw:.2f}kW (新能源盈余)")
+                if surplus > 0:
+                    grid_export_kw = surplus
+                    revenue = grid_export_kw * time_interval_hours * feed_in_price
+                    total_cost -= revenue
+                    notes.append(f"余电上网 {grid_export_kw:.2f}kW (收入 {revenue:.2f}元)")
+
+        elif storage_mode == "active_charge":
+            cfg = config.BESS_CONFIG[bes_id]
+            energy_space = (cfg["soc_max"] - self.state.bess_state[bes_id].soc) * cfg["capacity_kwh"]
+            max_charge_by_space = energy_space / cfg["charge_efficiency"] / time_interval_hours
+            max_charge = self.state.get_bess_max_charge_with_health(bes_id, time_interval_hours)
+            target_charge_kw = min(cfg["max_charge_power"], max_charge_by_space, max_charge)
+
+            renewable_for_load = min(total_renewable, load_kw)
+            renewable_surplus = max(0.0, total_renewable - load_kw)
+
+            charge_from_renewable = min(renewable_surplus, target_charge_kw)
+            remaining_charge_target = target_charge_kw - charge_from_renewable
+
+            if renewable_for_load > 0:
+                notes.append(f"[主动充电] 新能源供负荷 {renewable_for_load:.2f}kW")
+
+            if charge_from_renewable > 0:
+                bess_action[bes_id]["charge_kw"] = charge_from_renewable
+                notes.append(f"[主动充电] 新能源盈余充电 {charge_from_renewable:.2f}kW")
+
+            remaining_load = load_kw - renewable_for_load
+
+            if remaining_load > 0:
+                use_grid = grid_buy_price < diesel_gen_cost
+                diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
+
+                if use_grid:
+                    grid_import_load = remaining_load
+                    remaining_load = 0
+                    load_cost = grid_import_load * time_interval_hours * grid_buy_price
+                    total_cost += load_cost
+                    grid_import_kw += grid_import_load
+                    load_grid_import_kwh += grid_import_load * time_interval_hours
+                    notes.append(f"[主动充电] 谷时购电供负荷 {grid_import_load:.2f}kW")
+                else:
+                    if diesel_cap["can_run"]:
                         diesel_kw = min(remaining_load, diesel_cap["max_output"])
                         diesel_output[ds_id] = diesel_kw
                         remaining_load -= diesel_kw
@@ -150,37 +223,47 @@ class DispatchEngine:
                         else:
                             notes.append(f"柴油机恢复/持续运行，出力 {diesel_kw:.2f}kW")
 
-                if remaining_load > 0:
-                    load_shed_kw = remaining_load
-                    total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
-                    self.state.add_alert(
-                        "LOAD_SHEDDING",
-                        f"高价风险时段负荷缺口 {load_shed_kw:.2f}kW，禁止购电，执行甩负荷",
-                        {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw,
-                         "reason": "force_discharge_no_grid"}
-                    )
-                    notes.append(f"警告：高价风险时段，禁止购电，甩负荷 {load_shed_kw:.2f}kW")
-            else:
-                cfg = config.BESS_CONFIG[bes_id]
-                energy_space = (cfg["soc_max"] - self.state.bess_state[bes_id].soc) * cfg["capacity_kwh"]
-                max_charge_by_space = energy_space / cfg["charge_efficiency"] / time_interval_hours
-                max_charge = self.state.get_bess_max_charge_with_health(bes_id, time_interval_hours)
-                target_charge_kw = min(cfg["max_charge_power"], max_charge_by_space, max_charge)
+            if remaining_charge_target > 0 and remaining_load <= 0:
+                grid_for_charge = min(remaining_charge_target, cfg["max_charge_power"] - bess_action[bes_id]["charge_kw"])
+                if grid_for_charge > 0:
+                    bess_action[bes_id]["charge_kw"] += grid_for_charge
+                    grid_import_kw += grid_for_charge
+                    charge_cost = grid_for_charge * time_interval_hours * grid_buy_price
+                    total_cost += charge_cost
+                    arbitrage_charge_kwh += grid_for_charge * time_interval_hours
+                    arbitrage_charge_cost += charge_cost
+                    notes.append(f"[主动充电] 谷时购电充电 {grid_for_charge:.2f}kW (成本 {charge_cost:.4f}元)")
 
-                renewable_for_load = min(total_renewable, load_kw)
-                renewable_surplus = max(0.0, total_renewable - load_kw)
+            if remaining_load > 0:
+                load_shed_kw = remaining_load
+                total_available = renewable_for_load + diesel_output[ds_id] + (grid_import_kw - bess_action[bes_id]["charge_kw"] + charge_from_renewable)
+                self.state.add_alert(
+                    "LOAD_SHEDDING",
+                    f"负荷缺口 {load_shed_kw:.2f}kW，执行甩负荷",
+                    {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw}
+                )
+                notes.append(f"警告：甩负荷 {load_shed_kw:.2f}kW")
 
-                charge_from_renewable = min(renewable_surplus, target_charge_kw)
-                remaining_charge_target = target_charge_kw - charge_from_renewable
+        elif storage_mode == "priority_discharge":
+            if remaining_load > 0:
+                cfg_b = config.BESS_CONFIG[bes_id]
+                base_max_discharge = self.state.get_bess_max_discharge(bes_id, time_interval_hours)
+                max_discharge = base_max_discharge
 
-                if renewable_for_load > 0:
-                    notes.append(f"[主动充电] 新能源供负荷 {renewable_for_load:.2f}kW")
+                discharge_kw = min(remaining_load, max_discharge)
+                if discharge_kw > 0:
+                    bess_action[bes_id]["discharge_kw"] = discharge_kw
+                    remaining_load -= discharge_kw
+                    peak_price = config.get_peak_price()
+                    saved_cost = discharge_kw * time_interval_hours * peak_price
+                    notes.append(f"[优先放电] 峰时段电池放电 {discharge_kw:.2f}kW (避免购电，等效收益 {saved_cost:.4f}元)")
+                    arbitrage_discharge_kwh += discharge_kw * time_interval_hours
+                    arbitrage_discharge_revenue += saved_cost
 
-                if charge_from_renewable > 0:
-                    bess_action[bes_id]["charge_kw"] = charge_from_renewable
-                    notes.append(f"[主动充电] 新能源盈余充电 {charge_from_renewable:.2f}kW")
-
-                remaining_load = load_kw - renewable_for_load
+                    self.state._update_health_percent(bes_id)
+                    bh = self.state.bess_state[bes_id].health
+                    if bh.health_percent < cfg_b["health_derating_threshold"]:
+                        notes.append(f"注: 优先放电模式，放电功率不降额使用 {max_discharge:.1f}kW (健康度{bh.health_percent:.1f}%)")
 
                 if remaining_load > 0:
                     use_grid = grid_buy_price < diesel_gen_cost
@@ -193,7 +276,7 @@ class DispatchEngine:
                         total_cost += load_cost
                         grid_import_kw += grid_import_load
                         load_grid_import_kwh += grid_import_load * time_interval_hours
-                        notes.append(f"[主动充电] 谷时购电供负荷 {grid_import_load:.2f}kW")
+                        notes.append(f"外购电供负荷 {grid_import_load:.2f}kW (电价 {grid_buy_price:.2f}元/kWh)")
                     else:
                         if diesel_cap["can_run"]:
                             diesel_kw = min(remaining_load, diesel_cap["max_output"])
@@ -209,112 +292,15 @@ class DispatchEngine:
                             else:
                                 notes.append(f"柴油机恢复/持续运行，出力 {diesel_kw:.2f}kW")
 
-                if remaining_charge_target > 0 and remaining_load <= 0:
-                    grid_for_charge = min(remaining_charge_target, cfg["max_charge_power"] - bess_action[bes_id]["charge_kw"])
-                    if grid_for_charge > 0:
-                        bess_action[bes_id]["charge_kw"] += grid_for_charge
-                        grid_import_kw += grid_for_charge
-                        charge_cost = grid_for_charge * time_interval_hours * grid_buy_price
-                        total_cost += charge_cost
-                        arbitrage_charge_kwh += grid_for_charge * time_interval_hours
-                        arbitrage_charge_cost += charge_cost
-                        notes.append(f"[主动充电] 谷时购电充电 {grid_for_charge:.2f}kW (成本 {charge_cost:.4f}元)")
-
                 if remaining_load > 0:
                     load_shed_kw = remaining_load
-                    total_available = renewable_for_load + diesel_output[ds_id] + (grid_import_kw - bess_action[bes_id]["charge_kw"] + charge_from_renewable)
+                    total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
                     self.state.add_alert(
                         "LOAD_SHEDDING",
                         f"负荷缺口 {load_shed_kw:.2f}kW，执行甩负荷",
                         {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw}
                     )
                     notes.append(f"警告：甩负荷 {load_shed_kw:.2f}kW")
-
-        elif storage_mode == "priority_discharge":
-            if remaining_load > 0:
-                cfg_b = config.BESS_CONFIG[bes_id]
-                base_max_discharge = self.state.get_bess_max_discharge(bes_id, time_interval_hours)
-                max_discharge = base_max_discharge
-
-                discharge_kw = min(remaining_load, max_discharge)
-                if discharge_kw > 0:
-                    bess_action[bes_id]["discharge_kw"] = discharge_kw
-                    remaining_load -= discharge_kw
-                    if force_discharge_no_grid:
-                        saved_cost = discharge_kw * time_interval_hours * grid_buy_price
-                        notes.append(f"[强制放电] 高价时段电池放电 {discharge_kw:.2f}kW (避免高价购电，等效收益 {saved_cost:.4f}元)")
-                    else:
-                        peak_price = config.get_peak_price()
-                        saved_cost = discharge_kw * time_interval_hours * peak_price
-                        notes.append(f"[优先放电] 峰时段电池放电 {discharge_kw:.2f}kW (避免购电，等效收益 {saved_cost:.4f}元)")
-                    arbitrage_discharge_kwh += discharge_kw * time_interval_hours
-                    arbitrage_discharge_revenue += saved_cost
-
-                    self.state._update_health_percent(bes_id)
-                    bh = self.state.bess_state[bes_id].health
-                    if bh.health_percent < cfg_b["health_derating_threshold"]:
-                        notes.append(f"注: 优先放电模式，放电功率不降额使用 {max_discharge:.1f}kW (健康度{bh.health_percent:.1f}%)")
-
-                if remaining_load > 0:
-                    if force_discharge_no_grid:
-                        diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
-                        if diesel_cap["can_run"] and diesel_gen_cost < grid_buy_price:
-                            diesel_kw = min(remaining_load, diesel_cap["max_output"])
-                            diesel_output[ds_id] = diesel_kw
-                            remaining_load -= diesel_kw
-                            self.state.diesel_state[ds_id].output_kw = diesel_kw
-                            total_cost += diesel_kw * time_interval_hours * diesel_gen_cost
-                            if diesel_cap.get("startup_cost_applies"):
-                                startup_cost = config.DIESEL_CONFIG[ds_id]["startup_cost"]
-                                total_cost += startup_cost
-                                self.state.start_diesel(ds_id, now)
-                                notes.append(f"启动柴油机 (固定成本 {startup_cost}元)，出力 {diesel_kw:.2f}kW")
-                            else:
-                                notes.append(f"柴油机恢复/持续运行，出力 {diesel_kw:.2f}kW")
-                    else:
-                        use_grid = grid_buy_price < diesel_gen_cost
-                        diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
-
-                        if use_grid:
-                            grid_import_load = remaining_load
-                            remaining_load = 0
-                            load_cost = grid_import_load * time_interval_hours * grid_buy_price
-                            total_cost += load_cost
-                            grid_import_kw += grid_import_load
-                            load_grid_import_kwh += grid_import_load * time_interval_hours
-                            notes.append(f"外购电供负荷 {grid_import_load:.2f}kW (电价 {grid_buy_price:.2f}元/kWh)")
-                        else:
-                            if diesel_cap["can_run"]:
-                                diesel_kw = min(remaining_load, diesel_cap["max_output"])
-                                diesel_output[ds_id] = diesel_kw
-                                remaining_load -= diesel_kw
-                                self.state.diesel_state[ds_id].output_kw = diesel_kw
-                                total_cost += diesel_kw * time_interval_hours * diesel_gen_cost
-                                if diesel_cap.get("startup_cost_applies"):
-                                    startup_cost = config.DIESEL_CONFIG[ds_id]["startup_cost"]
-                                    total_cost += startup_cost
-                                    self.state.start_diesel(ds_id, now)
-                                    notes.append(f"启动柴油机 (固定成本 {startup_cost}元)，出力 {diesel_kw:.2f}kW")
-                                else:
-                                    notes.append(f"柴油机恢复/持续运行，出力 {diesel_kw:.2f}kW")
-
-                if remaining_load > 0:
-                    load_shed_kw = remaining_load
-                    total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
-                    alert_msg = f"负荷缺口 {load_shed_kw:.2f}kW，执行甩负荷"
-                    alert_data = {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw}
-                    if force_discharge_no_grid:
-                        alert_msg = f"高价风险时段负荷缺口 {load_shed_kw:.2f}kW，禁止购电，执行甩负荷"
-                        alert_data["reason"] = "force_discharge_no_grid"
-                    self.state.add_alert(
-                        "LOAD_SHEDDING",
-                        alert_msg,
-                        alert_data
-                    )
-                    if force_discharge_no_grid:
-                        notes.append(f"警告：高价风险时段，禁止购电，甩负荷 {load_shed_kw:.2f}kW")
-                    else:
-                        notes.append(f"警告：甩负荷 {load_shed_kw:.2f}kW")
 
             elif remaining_load < 0:
                 surplus = -remaining_load
@@ -340,28 +326,40 @@ class DispatchEngine:
 
         else:
             if remaining_load > 0:
-                if force_discharge_no_grid:
+                max_discharge = self.state.get_bess_max_discharge_with_health(bes_id, time_interval_hours)
+                discharge_kw = min(remaining_load, max_discharge)
+                if discharge_kw > 0:
+                    bess_action[bes_id]["discharge_kw"] = discharge_kw
+                    remaining_load -= discharge_kw
+                    notes.append(f"电池放电 {discharge_kw:.2f}kW")
+
+                    self.state._update_health_percent(bes_id)
+                    bh = self.state.bess_state[bes_id].health
                     cfg_b = config.BESS_CONFIG[bes_id]
-                    base_max_discharge = self.state.get_bess_max_discharge(bes_id, time_interval_hours)
-                    max_discharge = base_max_discharge
+                    if bh.health_percent < cfg_b["health_derating_threshold"]:
+                        notes.append(f"电池健康度{bh.health_percent:.1f}% < {cfg_b['health_derating_threshold']}%，已降额{cfg_b['power_derating_ratio']*100:.0f}%运行")
 
-                    discharge_kw = min(remaining_load, max_discharge)
-                    if discharge_kw > 0:
-                        bess_action[bes_id]["discharge_kw"] = discharge_kw
-                        remaining_load -= discharge_kw
-                        saved_cost = discharge_kw * time_interval_hours * grid_buy_price
-                        arbitrage_discharge_kwh += discharge_kw * time_interval_hours
-                        arbitrage_discharge_revenue += saved_cost
-                        notes.append(f"[强制放电] 高价时段电池放电 {discharge_kw:.2f}kW (避免高价购电，等效收益 {saved_cost:.4f}元)")
+                if remaining_load > 0:
+                    use_grid = grid_buy_price < diesel_gen_cost
+                    diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
 
-                    if remaining_load > 0:
-                        diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
-                        if diesel_cap["can_run"] and diesel_gen_cost < grid_buy_price:
+                    if use_grid:
+                        grid_import_load = remaining_load
+                        remaining_load = 0
+                        load_cost = grid_import_load * time_interval_hours * grid_buy_price
+                        total_cost += load_cost
+                        grid_import_kw += grid_import_load
+                        load_grid_import_kwh += grid_import_load * time_interval_hours
+                        notes.append(f"外购电 {grid_import_load:.2f}kW (电价 {grid_buy_price:.2f}元/kWh，低于柴油成本)")
+                    else:
+                        if diesel_cap["can_run"]:
                             diesel_kw = min(remaining_load, diesel_cap["max_output"])
                             diesel_output[ds_id] = diesel_kw
                             remaining_load -= diesel_kw
                             self.state.diesel_state[ds_id].output_kw = diesel_kw
+
                             total_cost += diesel_kw * time_interval_hours * diesel_gen_cost
+
                             if diesel_cap.get("startup_cost_applies"):
                                 startup_cost = config.DIESEL_CONFIG[ds_id]["startup_cost"]
                                 total_cost += startup_cost
@@ -369,71 +367,18 @@ class DispatchEngine:
                                 notes.append(f"启动柴油机 (固定成本 {startup_cost}元)，出力 {diesel_kw:.2f}kW")
                             else:
                                 notes.append(f"柴油机恢复/持续运行，出力 {diesel_kw:.2f}kW")
+                        else:
+                            notes.append(f"柴油机不可用: {diesel_cap.get('reason', '未知原因')}，且购电价({grid_buy_price})高于柴油成本({diesel_gen_cost})，不选择买电")
 
                     if remaining_load > 0:
                         load_shed_kw = remaining_load
                         total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
                         self.state.add_alert(
                             "LOAD_SHEDDING",
-                            f"高价风险时段负荷缺口 {load_shed_kw:.2f}kW，禁止购电，执行甩负荷",
-                            {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw,
-                             "reason": "force_discharge_no_grid"}
+                            f"负荷缺口 {load_shed_kw:.2f}kW，执行甩负荷",
+                            {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw}
                         )
-                        notes.append(f"警告：高价风险时段，禁止购电，甩负荷 {load_shed_kw:.2f}kW")
-                else:
-                    max_discharge = self.state.get_bess_max_discharge_with_health(bes_id, time_interval_hours)
-                    discharge_kw = min(remaining_load, max_discharge)
-                    if discharge_kw > 0:
-                        bess_action[bes_id]["discharge_kw"] = discharge_kw
-                        remaining_load -= discharge_kw
-                        notes.append(f"电池放电 {discharge_kw:.2f}kW")
-
-                        self.state._update_health_percent(bes_id)
-                        bh = self.state.bess_state[bes_id].health
-                        cfg_b = config.BESS_CONFIG[bes_id]
-                        if bh.health_percent < cfg_b["health_derating_threshold"]:
-                            notes.append(f"电池健康度{bh.health_percent:.1f}% < {cfg_b['health_derating_threshold']}%，已降额{cfg_b['power_derating_ratio']*100:.0f}%运行")
-
-                    if remaining_load > 0:
-                        use_grid = grid_buy_price < diesel_gen_cost
-                        diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
-
-                        if use_grid:
-                            grid_import_load = remaining_load
-                            remaining_load = 0
-                            load_cost = grid_import_load * time_interval_hours * grid_buy_price
-                            total_cost += load_cost
-                            grid_import_kw += grid_import_load
-                            load_grid_import_kwh += grid_import_load * time_interval_hours
-                            notes.append(f"外购电 {grid_import_load:.2f}kW (电价 {grid_buy_price:.2f}元/kWh，低于柴油成本)")
-                        else:
-                            if diesel_cap["can_run"]:
-                                diesel_kw = min(remaining_load, diesel_cap["max_output"])
-                                diesel_output[ds_id] = diesel_kw
-                                remaining_load -= diesel_kw
-                                self.state.diesel_state[ds_id].output_kw = diesel_kw
-
-                                total_cost += diesel_kw * time_interval_hours * diesel_gen_cost
-
-                                if diesel_cap.get("startup_cost_applies"):
-                                    startup_cost = config.DIESEL_CONFIG[ds_id]["startup_cost"]
-                                    total_cost += startup_cost
-                                    self.state.start_diesel(ds_id, now)
-                                    notes.append(f"启动柴油机 (固定成本 {startup_cost}元)，出力 {diesel_kw:.2f}kW")
-                                else:
-                                    notes.append(f"柴油机恢复/持续运行，出力 {diesel_kw:.2f}kW")
-                            else:
-                                notes.append(f"柴油机不可用: {diesel_cap.get('reason', '未知原因')}，且购电价({grid_buy_price})高于柴油成本({diesel_gen_cost})，不选择买电")
-
-                        if remaining_load > 0:
-                            load_shed_kw = remaining_load
-                            total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
-                            self.state.add_alert(
-                                "LOAD_SHEDDING",
-                                f"负荷缺口 {load_shed_kw:.2f}kW，执行甩负荷",
-                                {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw}
-                            )
-                            notes.append(f"警告：甩负荷 {load_shed_kw:.2f}kW (本地所有可用源出力不足)")
+                        notes.append(f"警告：甩负荷 {load_shed_kw:.2f}kW (本地所有可用源出力不足)")
 
             elif remaining_load < 0:
                 surplus = -remaining_load

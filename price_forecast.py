@@ -44,12 +44,17 @@ class PriceForecastManager:
         if forecast_date in self._forecasts_by_date:
             old_forecast_id = self._forecasts_by_date[forecast_date]
             old_forecast = self._forecasts.get(old_forecast_id)
-            if old_forecast and old_forecast.status == "active":
-                self.deactivate_strategy(old_forecast_id)
+            old_strategy = None
+            if old_forecast:
+                old_strategy = self.get_strategy_by_forecast(old_forecast_id)
+                if old_forecast.status == "active":
+                    self.deactivate_strategy(old_forecast_id)
             if old_forecast_id in self._forecasts:
-                self._forecasts[old_forecast_id].status = "expired"
-            if old_forecast_id in self._strategies:
-                self._strategies[old_forecast_id].status = "expired"
+                del self._forecasts[old_forecast_id]
+            if old_forecast_id in self._comparisons:
+                del self._comparisons[old_forecast_id]
+            if old_strategy and old_strategy.strategy_id in self._strategies:
+                del self._strategies[old_strategy.strategy_id]
 
         self._counter += 1
         forecast_id = f"FCST-{self._counter:06d}"
@@ -246,6 +251,21 @@ class PriceForecastManager:
 
         return True
 
+    def _validate_active_strategy(self) -> bool:
+        if not self._active_strategy_id:
+            return False
+        strategy = self._strategies.get(self._active_strategy_id)
+        if not strategy or strategy.status != "active":
+            self._active_strategy_id = None
+            return False
+        forecast = self._forecasts.get(strategy.forecast_id)
+        if not forecast or forecast.status != "active":
+            self._active_strategy_id = None
+            if strategy:
+                strategy.status = "deactivated"
+            return False
+        return True
+
     def deactivate_strategy(self, forecast_id: str) -> bool:
         forecast = self._forecasts.get(forecast_id)
         if not forecast:
@@ -293,19 +313,22 @@ class PriceForecastManager:
                 abnormal=False,
             )
 
+        today_str = datetime.now().strftime("%Y-%m-%d")
         self.state.current_storage_plan = plan
-        self.state.last_plan_generation_date = plan_date
+        self.state.last_plan_generation_date = today_str
 
     def _restore_default_storage_plan(self):
         self.state.generate_storage_plan(datetime.now())
 
     def get_active_strategy(self) -> Optional[PurchaseStrategy]:
-        if not self._active_strategy_id:
+        if not self._validate_active_strategy():
             return None
         return self._strategies.get(self._active_strategy_id)
 
     def get_active_forecast(self) -> Optional[PriceForecastRecord]:
-        strategy = self.get_active_strategy()
+        if not self._validate_active_strategy():
+            return None
+        strategy = self._strategies.get(self._active_strategy_id)
         if not strategy:
             return None
         return self._forecasts.get(strategy.forecast_id)
@@ -335,14 +358,22 @@ class PriceForecastManager:
         if now is None:
             now = datetime.now()
 
-        strategy = self.get_active_strategy()
+        if not self._validate_active_strategy():
+            return False
+
+        strategy = self._strategies.get(self._active_strategy_id)
         if not strategy:
             return False
 
         today_str = now.strftime("%Y-%m-%d")
-        if strategy.forecast_date < today_str:
-            self.deactivate_strategy(strategy.forecast_id)
-            forecast = self._forecasts.get(strategy.forecast_id)
+        forecast_date_dt = datetime.strptime(strategy.forecast_date, "%Y-%m-%d").date()
+        today_dt = now.date()
+        next_day_dt = forecast_date_dt + timedelta(days=1)
+
+        if today_dt >= next_day_dt:
+            forecast_id = strategy.forecast_id
+            self.deactivate_strategy(forecast_id)
+            forecast = self._forecasts.get(forecast_id)
             if forecast:
                 forecast.status = "expired"
             strategy.status = "expired"

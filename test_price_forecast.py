@@ -62,12 +62,37 @@ class TestPriceForecastManager:
     def test_submit_forecast_override_same_date(self, pf_manager):
         prices1 = [0.35] * 24
         result1 = pf_manager.submit_forecast(prices1, "2024-01-01")
+        old_id = result1["forecast"].forecast_id
 
         prices2 = [0.4] * 24
         result2 = pf_manager.submit_forecast(prices2, "2024-01-01")
 
-        forecast1 = pf_manager.get_forecast(result1["forecast"].forecast_id)
-        assert forecast1.status == "expired"
+        forecast1 = pf_manager.get_forecast(old_id)
+        assert forecast1 is None
+
+        forecast2 = pf_manager.get_forecast(result2["forecast"].forecast_id)
+        assert forecast2 is not None
+        assert forecast2.status == "pending"
+
+        forecast_by_date = pf_manager.get_forecast_by_date("2024-01-01")
+        assert forecast_by_date.forecast_id == result2["forecast"].forecast_id
+
+        all_forecasts = pf_manager.list_forecasts()
+        assert len(all_forecasts) == 1
+        assert all_forecasts[0].forecast_id == result2["forecast"].forecast_id
+
+    def test_submit_forecast_override_active_same_date(self, pf_manager):
+        prices1 = [0.35] * 24
+        result1 = pf_manager.submit_forecast(prices1, "2024-06-20")
+        pf_manager.activate_strategy(result1["forecast"].forecast_id)
+
+        assert pf_manager.get_active_strategy() is not None
+
+        prices2 = [0.4] * 24
+        result2 = pf_manager.submit_forecast(prices2, "2024-06-20")
+
+        assert pf_manager.get_active_strategy() is None
+        assert pf_manager.get_forecast(result1["forecast"].forecast_id) is None
 
         forecast2 = pf_manager.get_forecast(result2["forecast"].forecast_id)
         assert forecast2.status == "pending"
@@ -220,6 +245,45 @@ class TestPriceForecastManager:
         assert stats.avg_cost_with_strategy > 0
         assert stats.avg_cost_without_strategy > 0
 
+    def test_strategy_state_consistency_after_activation(self, pf_manager):
+        prices = [0.5] * 24
+        result = pf_manager.submit_forecast(prices, "2024-06-20")
+        forecast_id = result["forecast"].forecast_id
+        pf_manager.activate_strategy(forecast_id)
+
+        for _ in range(10):
+            assert pf_manager.get_active_strategy() is not None
+            assert pf_manager.get_active_forecast() is not None
+            assert pf_manager.get_active_strategy().status == "active"
+            assert pf_manager.get_active_forecast().status == "active"
+
+    def test_expire_strategy_on_next_day(self, pf_manager):
+        prices = [0.5] * 24
+        result = pf_manager.submit_forecast(prices, "2024-06-20")
+        pf_manager.activate_strategy(result["forecast"].forecast_id)
+
+        same_day = datetime(2024, 6, 20, 23, 59, 0)
+        expired = pf_manager.check_and_expire_strategy(same_day)
+        assert expired is False
+        assert pf_manager.get_active_strategy() is not None
+
+        next_day = datetime(2024, 6, 21, 0, 0, 0)
+        expired = pf_manager.check_and_expire_strategy(next_day)
+        assert expired is True
+        assert pf_manager.get_active_strategy() is None
+
+    def test_validate_active_strategy_cleanup_inconsistent_state(self, pf_manager):
+        prices = [0.5] * 24
+        result = pf_manager.submit_forecast(prices, "2024-06-20")
+        pf_manager.activate_strategy(result["forecast"].forecast_id)
+
+        assert pf_manager.get_active_strategy() is not None
+
+        pf_manager._active_strategy_id = "INVALID-STRATEGY-ID"
+
+        assert pf_manager.get_active_strategy() is None
+        assert pf_manager._active_strategy_id is None
+
 
 class TestDispatchWithPriceForecast:
     def test_dispatch_with_active_forecast_price_used(self, state, engine, pf_manager):
@@ -309,6 +373,28 @@ class TestDispatchWithPriceForecast:
 
         assert state.current_storage_plan is not None
         assert state.current_storage_plan != plan_after_activation
+
+    def test_dispatch_force_discharge_prohibits_grid_purchase(self, state, engine, pf_manager):
+        peak_price = config.get_peak_price()
+        force_price = peak_price * 2.0
+        prices = [0.5] * 24
+        prices[12] = force_price
+
+        result = pf_manager.submit_forecast(prices)
+        pf_manager.activate_strategy(result["forecast"].forecast_id)
+
+        state.bess_state["bes1"].soc = 0.2
+        state.report_load(LoadReport(load_kw=800.0, timestamp=datetime.now()))
+
+        now = datetime(2024, 6, 18, 12, 0, 0)
+        decision = engine.execute(now)
+
+        assert decision.grid_import_kw <= 0.0001
+        assert any("高价风险时段" in note for note in decision.notes)
+        has_load_shed = any(
+            a["type"] == "LOAD_SHEDDING" for a in state.alerts
+        )
+        assert has_load_shed
 
 
 class TestEdgeCases:
