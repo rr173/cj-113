@@ -3,13 +3,15 @@ from flask import Flask, request, jsonify
 from dataclasses import asdict
 
 import config
-from models import MicrogridState, SourceReport, LoadReport
+from models import MicrogridState, SourceReport, LoadReport, SimulationStatus
 from dispatcher import DispatchEngine
+from simulation import SimulationEngine
 
 app = Flask(__name__)
 
 state = MicrogridState()
 engine = DispatchEngine(state)
+sim_engine = SimulationEngine(state)
 
 
 def _serialize(obj):
@@ -720,6 +722,253 @@ def get_all_config():
     })
 
 
+@app.route("/api/simulation/scenarios", methods=["POST"])
+def create_scenario():
+    """
+    创建仿真场景
+    请求体: {
+        "name": "阴天场景",
+        "description": "光伏出力仅为额定20%",
+        "duration_hours": 24,
+        "time_step_minutes": 1,
+        "pv_series": {
+            "pv1": {
+                "segments": [
+                    {"start_minute": 480, "end_minute": 720, "value_kw": 20},
+                    {"start_minute": 720, "end_minute": 840, "value_kw": 30}
+                ]
+            }
+        },
+        "load_series": {
+            "segments": [
+                {"start_minute": 0, "end_minute": 1440, "value_kw": 300}
+            ]
+        },
+        "initial_soc_override": {"bes1": 0.6}
+    }
+    """
+    data = request.get_json(force=True) or {}
+    if "name" not in data:
+        return jsonify({"error": "缺少必填字段: name"}), 400
+
+    scenario = sim_engine.create_scenario(data)
+    return jsonify({
+        "status": "ok",
+        "message": "场景创建成功",
+        "scenario": scenario.to_dict(),
+    })
+
+
+@app.route("/api/simulation/scenarios", methods=["GET"])
+def list_scenarios():
+    """查询仿真场景列表"""
+    scenarios = sim_engine.list_scenarios()
+    return jsonify({
+        "status": "ok",
+        "total": len(scenarios),
+        "scenarios": scenarios,
+    })
+
+
+@app.route("/api/simulation/scenarios/<scenario_id>", methods=["GET"])
+def get_scenario_detail(scenario_id):
+    """查询仿真场景详情"""
+    scenario = sim_engine.get_scenario(scenario_id)
+    if scenario is None:
+        return jsonify({"error": f"未找到场景: {scenario_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "scenario": scenario.to_dict(),
+    })
+
+
+@app.route("/api/simulation/scenarios/<scenario_id>", methods=["PUT"])
+def update_scenario(scenario_id):
+    """更新仿真场景"""
+    data = request.get_json(force=True) or {}
+    scenario = sim_engine.update_scenario(scenario_id, data)
+    if scenario is None:
+        return jsonify({"error": f"未找到场景: {scenario_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "message": "场景已更新",
+        "scenario": scenario.to_dict(),
+    })
+
+
+@app.route("/api/simulation/scenarios/<scenario_id>/copy", methods=["POST"])
+def copy_scenario(scenario_id):
+    """
+    复制仿真场景
+    请求体: {"new_name": "阴天场景(修改版)"} 可选
+    """
+    data = request.get_json(force=True) or {}
+    new_name = data.get("new_name")
+    new_scenario = sim_engine.copy_scenario(scenario_id, new_name)
+    if new_scenario is None:
+        return jsonify({"error": f"未找到源场景: {scenario_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "message": "场景复制成功",
+        "scenario": new_scenario.to_dict(),
+    })
+
+
+@app.route("/api/simulation/scenarios/<scenario_id>", methods=["DELETE"])
+def delete_scenario(scenario_id):
+    """删除仿真场景"""
+    success = sim_engine.delete_scenario(scenario_id)
+    if not success:
+        return jsonify({"error": f"未找到场景: {scenario_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "message": f"场景 {scenario_id} 已删除",
+    })
+
+
+@app.route("/api/simulation/run", methods=["POST"])
+def run_simulation():
+    """
+    运行仿真
+    请求体: {"scenario_id": "SCEN-XXXXXX"}
+    """
+    data = request.get_json(force=True) or {}
+    scenario_id = data.get("scenario_id")
+    if not scenario_id:
+        return jsonify({"error": "缺少必填字段: scenario_id"}), 400
+
+    report = sim_engine.run_simulation(scenario_id)
+    if report is None:
+        return jsonify({"error": f"未找到场景: {scenario_id}"}), 404
+
+    return jsonify({
+        "status": "ok",
+        "message": "仿真执行完成" if report.status == SimulationStatus.COMPLETED else "仿真执行失败",
+        "simulation": report.to_dict(include_steps=False),
+    })
+
+
+@app.route("/api/simulation/simulations", methods=["GET"])
+def list_simulations():
+    """
+    查询仿真任务列表
+    参数: scenario_id (可选，按场景过滤)
+    """
+    scenario_id = request.args.get("scenario_id")
+    simulations = sim_engine.list_simulations(scenario_id)
+    return jsonify({
+        "status": "ok",
+        "total": len(simulations),
+        "simulations": simulations,
+    })
+
+
+@app.route("/api/simulation/simulations/<sim_id>", methods=["GET"])
+def get_simulation_status(sim_id):
+    """查询仿真状态/结果"""
+    report = sim_engine.get_simulation(sim_id)
+    if report is None:
+        return jsonify({"error": f"未找到仿真任务: {sim_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "simulation": report.to_dict(include_steps=False),
+    })
+
+
+@app.route("/api/simulation/simulations/<sim_id>/report", methods=["GET"])
+def get_simulation_report(sim_id):
+    """查询仿真报告详情"""
+    report = sim_engine.get_simulation(sim_id)
+    if report is None:
+        return jsonify({"error": f"未找到仿真任务: {sim_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "report": report.to_dict(include_steps=False),
+    })
+
+
+@app.route("/api/simulation/simulations/<sim_id>/steps", methods=["GET"])
+def get_simulation_steps(sim_id):
+    """
+    查询仿真逐步记录
+    参数: limit (可选), offset (可选)
+    """
+    try:
+        limit = int(request.args.get("limit", 100))
+        offset = int(request.args.get("offset", 0))
+    except ValueError:
+        return jsonify({"error": "limit 和 offset 必须是整数"}), 400
+
+    report = sim_engine.get_simulation(sim_id)
+    if report is None:
+        return jsonify({"error": f"未找到仿真任务: {sim_id}"}), 404
+
+    all_steps = report.step_records
+    total = len(all_steps)
+    sliced = all_steps[offset: offset + limit]
+
+    steps_data = [
+        {
+            "step_index": s.step_index,
+            "simulation_time": s.simulation_time.isoformat(),
+            "scenario_minute": s.scenario_minute,
+            "pv_output": s.pv_output,
+            "wt_output": s.wt_output,
+            "diesel_output": s.diesel_output,
+            "bess_soc_before_percent": {k: round(v * 100, 2) for k, v in s.bess_soc_before.items()},
+            "bess_soc_after_percent": {k: round(v * 100, 2) for k, v in s.bess_soc_after.items()},
+            "bess_charge_kw": s.bess_charge_kw,
+            "bess_discharge_kw": s.bess_discharge_kw,
+            "grid_import_kw": s.grid_import_kw,
+            "grid_export_kw": s.grid_export_kw,
+            "load_served_kw": s.load_served_kw,
+            "load_shed_kw": s.load_shed_kw,
+            "step_cost": round(s.step_cost, 4),
+            "tariff_period": s.tariff_period,
+            "notes": s.notes,
+        }
+        for s in sliced
+    ]
+
+    return jsonify({
+        "status": "ok",
+        "simulation_id": sim_id,
+        "total_steps": total,
+        "returned": len(steps_data),
+        "limit": limit,
+        "offset": offset,
+        "steps": steps_data,
+    })
+
+
+@app.route("/api/simulation/compare", methods=["GET"])
+def compare_simulations():
+    """
+    对比两个仿真结果
+    参数: sim_a_id, sim_b_id
+    """
+    sim_a_id = request.args.get("sim_a_id")
+    sim_b_id = request.args.get("sim_b_id")
+
+    if not sim_a_id or not sim_b_id:
+        return jsonify({"error": "缺少必填参数: sim_a_id, sim_b_id"}), 400
+
+    comparison = sim_engine.compare_simulations(sim_a_id, sim_b_id)
+    if comparison is None:
+        sim_a = sim_engine.get_simulation(sim_a_id)
+        sim_b = sim_engine.get_simulation(sim_b_id)
+        if sim_a is None:
+            return jsonify({"error": f"未找到仿真任务: {sim_a_id}"}), 404
+        if sim_b is None:
+            return jsonify({"error": f"未找到仿真任务: {sim_b_id}"}), 404
+        return jsonify({"error": "两个仿真都需要已完成状态才能对比"}), 400
+
+    return jsonify({
+        "status": "ok",
+        "comparison": comparison.to_dict(),
+    })
+
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({
@@ -769,6 +1018,18 @@ def _list_endpoints():
         "PUT /api/config/bess_soc - 修改SOC区间",
         "GET /api/config/all - 查看全部配置",
         "GET /api/health - 健康检查",
+        "POST /api/simulation/scenarios - 创建仿真场景",
+        "GET /api/simulation/scenarios - 查询仿真场景列表",
+        "GET /api/simulation/scenarios/<id> - 查询仿真场景详情",
+        "PUT /api/simulation/scenarios/<id> - 更新仿真场景",
+        "POST /api/simulation/scenarios/<id>/copy - 复制仿真场景",
+        "DELETE /api/simulation/scenarios/<id> - 删除仿真场景",
+        "POST /api/simulation/run - 运行仿真",
+        "GET /api/simulation/simulations - 查询仿真任务列表",
+        "GET /api/simulation/simulations/<id> - 查询仿真状态",
+        "GET /api/simulation/simulations/<id>/report - 查询仿真报告",
+        "GET /api/simulation/simulations/<id>/steps - 查询仿真逐步记录",
+        "GET /api/simulation/compare - 对比两个仿真结果",
     ]
 
 
@@ -781,6 +1042,11 @@ if __name__ == "__main__":
     print(f"柴油发电机: {list(config.DIESEL_CONFIG.keys())}")
     print(f"电池储能: {list(config.BESS_CONFIG.keys())}")
     print(f"初始电池SOC: {config.BESS_CONFIG['bes1']['initial_soc'] * 100:.0f}%")
+    print("-" * 60)
+    print("多场景仿真与回测引擎: 已启用")
+    print("  - 创建场景: POST /api/simulation/scenarios")
+    print("  - 运行仿真: POST /api/simulation/run")
+    print("  - 对比结果: GET /api/simulation/compare")
     print("=" * 60)
     print("服务地址: http://127.0.0.1:5001")
     print("健康检查: http://127.0.0.1:5001/api/health")

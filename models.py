@@ -1018,3 +1018,234 @@ class MicrogridState:
                 "plan_id": ev.plan_id,
             })
         return result
+
+
+@dataclass
+class TimeSeriesSegment:
+    start_minute: int
+    end_minute: int
+    value_kw: float
+
+
+@dataclass
+class SourceTimeSeries:
+    source_id: str
+    source_type: str
+    segments: List[TimeSeriesSegment] = field(default_factory=list)
+
+
+@dataclass
+class LoadTimeSeries:
+    segments: List[TimeSeriesSegment] = field(default_factory=list)
+
+
+@dataclass
+class SimulationScenario:
+    scenario_id: str
+    name: str
+    description: str = ""
+    duration_hours: int = 24
+    time_step_minutes: int = 1
+    pv_series: Dict[str, SourceTimeSeries] = field(default_factory=dict)
+    wt_series: Dict[str, SourceTimeSeries] = field(default_factory=dict)
+    diesel_available: Dict[str, bool] = field(default_factory=dict)
+    load_series: LoadTimeSeries = field(default_factory=LoadTimeSeries)
+    initial_soc_override: Dict[str, float] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "scenario_id": self.scenario_id,
+            "name": self.name,
+            "description": self.description,
+            "duration_hours": self.duration_hours,
+            "time_step_minutes": self.time_step_minutes,
+            "pv_series": {
+                sid: {
+                    "source_id": s.source_id,
+                    "source_type": s.source_type,
+                    "segments": [
+                        {"start_minute": seg.start_minute, "end_minute": seg.end_minute, "value_kw": seg.value_kw}
+                        for seg in s.segments
+                    ]
+                }
+                for sid, s in self.pv_series.items()
+            },
+            "wt_series": {
+                sid: {
+                    "source_id": s.source_id,
+                    "source_type": s.source_type,
+                    "segments": [
+                        {"start_minute": seg.start_minute, "end_minute": seg.end_minute, "value_kw": seg.value_kw}
+                        for seg in s.segments
+                    ]
+                }
+                for sid, s in self.wt_series.items()
+            },
+            "diesel_available": self.diesel_available,
+            "load_series": {
+                "segments": [
+                    {"start_minute": seg.start_minute, "end_minute": seg.end_minute, "value_kw": seg.value_kw}
+                    for seg in self.load_series.segments
+                ]
+            },
+            "initial_soc_override": self.initial_soc_override,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+class SimulationStatus:
+    NOT_RUN = "not_run"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass
+class SimulationStepRecord:
+    step_index: int
+    simulation_time: datetime
+    scenario_minute: int
+    pv_output: Dict[str, float]
+    wt_output: Dict[str, float]
+    diesel_output: Dict[str, float]
+    bess_soc_before: Dict[str, float]
+    bess_soc_after: Dict[str, float]
+    bess_charge_kw: Dict[str, float]
+    bess_discharge_kw: Dict[str, float]
+    grid_import_kw: float
+    grid_export_kw: float
+    load_served_kw: float
+    load_shed_kw: float
+    step_cost: float
+    tariff_period: str
+    notes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SimulationReport:
+    simulation_id: str
+    scenario_id: str
+    scenario_name: str
+    status: str
+    total_steps: int = 0
+    completed_steps: int = 0
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    error_message: Optional[str] = None
+    total_cost: float = 0.0
+    total_grid_import_kwh: float = 0.0
+    total_grid_export_kwh: float = 0.0
+    peak_grid_import_kwh: float = 0.0
+    total_diesel_generated_kwh: float = 0.0
+    total_diesel_starts: int = 0
+    total_bess_charge_kwh: Dict[str, float] = field(default_factory=dict)
+    total_bess_discharge_kwh: Dict[str, float] = field(default_factory=dict)
+    total_load_shed_kwh: float = 0.0
+    initial_soc: Dict[str, float] = field(default_factory=dict)
+    final_soc: Dict[str, float] = field(default_factory=dict)
+    cost_curve: List[Dict[str, Any]] = field(default_factory=list)
+    soc_curve: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    step_records: List[SimulationStepRecord] = field(default_factory=list)
+
+    def to_dict(self, include_steps: bool = False) -> Dict[str, Any]:
+        result = {
+            "simulation_id": self.simulation_id,
+            "scenario_id": self.scenario_id,
+            "scenario_name": self.scenario_name,
+            "status": self.status,
+            "total_steps": self.total_steps,
+            "completed_steps": self.completed_steps,
+            "start_time": self.start_time.isoformat() if self.start_time else None,
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+            "error_message": self.error_message,
+            "summary": {
+                "total_cost": round(self.total_cost, 4),
+                "total_grid_import_kwh": round(self.total_grid_import_kwh, 4),
+                "total_grid_export_kwh": round(self.total_grid_export_kwh, 4),
+                "peak_grid_import_kwh": round(self.peak_grid_import_kwh, 4),
+                "peak_import_ratio": round(
+                    self.peak_grid_import_kwh / self.total_grid_import_kwh if self.total_grid_import_kwh > 0 else 0.0,
+                    4
+                ),
+                "total_diesel_generated_kwh": round(self.total_diesel_generated_kwh, 4),
+                "total_diesel_starts": self.total_diesel_starts,
+                "total_bess_charge_kwh": {k: round(v, 4) for k, v in self.total_bess_charge_kwh.items()},
+                "total_bess_discharge_kwh": {k: round(v, 4) for k, v in self.total_bess_discharge_kwh.items()},
+                "bess_cycles_approx": {
+                    k: round(v / 500.0, 4) for k, v in self.total_bess_discharge_kwh.items()
+                },
+                "total_load_shed_kwh": round(self.total_load_shed_kwh, 4),
+                "initial_soc": {k: round(v * 100, 2) for k, v in self.initial_soc.items()},
+                "final_soc": {k: round(v * 100, 2) for k, v in self.final_soc.items()},
+            },
+            "cost_curve": self.cost_curve,
+            "soc_curve": self.soc_curve,
+        }
+        if include_steps:
+            result["step_records"] = [
+                {
+                    "step_index": s.step_index,
+                    "simulation_time": s.simulation_time.isoformat(),
+                    "scenario_minute": s.scenario_minute,
+                    "pv_output": s.pv_output,
+                    "wt_output": s.wt_output,
+                    "diesel_output": s.diesel_output,
+                    "bess_soc_before": {k: round(v * 100, 2) for k, v in s.bess_soc_before.items()},
+                    "bess_soc_after": {k: round(v * 100, 2) for k, v in s.bess_soc_after.items()},
+                    "bess_charge_kw": s.bess_charge_kw,
+                    "bess_discharge_kw": s.bess_discharge_kw,
+                    "grid_import_kw": s.grid_import_kw,
+                    "grid_export_kw": s.grid_export_kw,
+                    "load_served_kw": s.load_served_kw,
+                    "load_shed_kw": s.load_shed_kw,
+                    "step_cost": round(s.step_cost, 4),
+                    "tariff_period": s.tariff_period,
+                    "notes": s.notes,
+                }
+                for s in self.step_records
+            ]
+        return result
+
+
+@dataclass
+class SimulationComparisonReport:
+    simulation_a_id: str
+    simulation_b_id: str
+    scenario_a_name: str
+    scenario_b_name: str
+    cost_diff: float = 0.0
+    grid_import_diff: float = 0.0
+    grid_export_diff: float = 0.0
+    diesel_starts_diff: int = 0
+    diesel_generated_diff: float = 0.0
+    bess_cycles_diff: Dict[str, float] = field(default_factory=dict)
+    bess_charge_diff: Dict[str, float] = field(default_factory=dict)
+    bess_discharge_diff: Dict[str, float] = field(default_factory=dict)
+    load_shed_diff: float = 0.0
+    final_soc_diff: Dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "simulation_a_id": self.simulation_a_id,
+            "simulation_b_id": self.simulation_b_id,
+            "scenario_a_name": self.scenario_a_name,
+            "scenario_b_name": self.scenario_b_name,
+            "differences": {
+                "total_cost": {
+                    "a_minus_b": round(self.cost_diff, 4),
+                    "percent_change": round((self.cost_diff / abs(self.cost_diff - self.cost_diff + 1e-9)) * 0, 4),
+                },
+                "grid_import_kwh": round(self.grid_import_diff, 4),
+                "grid_export_kwh": round(self.grid_export_diff, 4),
+                "diesel_starts": self.diesel_starts_diff,
+                "diesel_generated_kwh": round(self.diesel_generated_diff, 4),
+                "bess_cycles_approx": {k: round(v, 4) for k, v in self.bess_cycles_diff.items()},
+                "bess_charge_kwh": {k: round(v, 4) for k, v in self.bess_charge_diff.items()},
+                "bess_discharge_kwh": {k: round(v, 4) for k, v in self.bess_discharge_diff.items()},
+                "load_shed_kwh": round(self.load_shed_diff, 4),
+                "final_soc_percent": {k: round(v * 100, 2) for k, v in self.final_soc_diff.items()},
+            }
+        }
