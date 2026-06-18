@@ -317,6 +317,20 @@ class SimulationEngine:
                 else:
                     sim_state.bess_state[bes_id].soc = cfg["initial_soc"]
 
+        sim_state._is_simulation_mode = True
+
+        original_report_source = sim_state.report_source
+
+        def simulation_report_source(report):
+            if report.source_type == "pv":
+                sim_state.pv_reports[report.source_id] = report
+            elif report.source_type == "wt":
+                sim_state.wt_reports[report.source_id] = report
+            elif report.source_type == "diesel":
+                sim_state.diesel_reports[report.source_id] = report
+
+        sim_state.report_source = simulation_report_source
+
         return sim_state
 
     def _inject_scenario_data(self, state: MicrogridState, scenario: SimulationScenario,
@@ -325,42 +339,34 @@ class SimulationEngine:
             pv_series = scenario.pv_series.get(pv_id)
             if pv_series and pv_series.segments:
                 value = _get_value_from_segments(pv_series.segments, scenario_minute)
-                report = SourceReport(
-                    source_id=pv_id,
-                    source_type="pv",
-                    power_kw=value,
-                    available=True,
-                    timestamp=timestamp,
-                )
+                available = True
             else:
-                report = SourceReport(
-                    source_id=pv_id,
-                    source_type="pv",
-                    power_kw=0.0,
-                    available=False,
-                    timestamp=timestamp,
-                )
+                value = 0.0
+                available = True
+            report = SourceReport(
+                source_id=pv_id,
+                source_type="pv",
+                power_kw=value,
+                available=available,
+                timestamp=timestamp,
+            )
             state.report_source(report)
 
         for wt_id in config.WT_CONFIG:
             wt_series = scenario.wt_series.get(wt_id)
             if wt_series and wt_series.segments:
                 value = _get_value_from_segments(wt_series.segments, scenario_minute)
-                report = SourceReport(
-                    source_id=wt_id,
-                    source_type="wt",
-                    power_kw=value,
-                    available=True,
-                    timestamp=timestamp,
-                )
+                available = True
             else:
-                report = SourceReport(
-                    source_id=wt_id,
-                    source_type="wt",
-                    power_kw=0.0,
-                    available=False,
-                    timestamp=timestamp,
-                )
+                value = 0.0
+                available = True
+            report = SourceReport(
+                source_id=wt_id,
+                source_type="wt",
+                power_kw=value,
+                available=available,
+                timestamp=timestamp,
+            )
             state.report_source(report)
 
         for ds_id in config.DIESEL_CONFIG:

@@ -345,6 +345,70 @@ def test_step_records_detail():
     print()
 
 
+def test_undefined_source_no_fault():
+    print("=" * 60)
+    print("测试 6: 未定义时序曲线的源不触发故障预案")
+    print("=" * 60)
+
+    real_state = MicrogridState()
+    real_state.bess_state["bes1"].soc = 0.5
+    sim_engine = SimulationEngine(real_state)
+
+    scenario_data = {
+        "name": "只定义光伏，不定义风机",
+        "description": "场景中只定义pv1、pv2，不定义wt1",
+        "duration_hours": 2,
+        "time_step_minutes": 30,
+        "pv_series": {
+            "pv1": {
+                "segments": [{"start_minute": 0, "end_minute": 120, "value_kw": 50.0}]
+            },
+            "pv2": {
+                "segments": [{"start_minute": 0, "end_minute": 120, "value_kw": 50.0}]
+            }
+        },
+        "load_series": {
+            "segments": [{"start_minute": 0, "end_minute": 120, "value_kw": 200.0}]
+        },
+        "diesel_available": {"ds1": True},
+    }
+
+    scenario = sim_engine.create_scenario(scenario_data)
+    print(f"  [OK] 创建场景: {scenario.name}")
+    print(f"       已定义源: pv1, pv2 (未定义: wt1")
+
+    report = sim_engine.run_simulation(scenario.scenario_id)
+    assert report is not None
+    assert report.status == SimulationStatus.COMPLETED
+
+    print(f"  [OK] 仿真完成: {report.simulation_id}")
+    print(f"       总成本: {report.total_cost:.2f} 元")
+    print(f"       柴油机启动次数: {report.total_diesel_starts}")
+
+    has_fault_notes = False
+    fault_triggered = False
+
+    for step in report.step_records:
+        for note in step.notes:
+            if "故障" in note or "fault" in note.lower() or "掉线" in note or "启动柴油机" in note:
+                print(f"       警告: 步骤 {step.step_index} 出现故障相关记录: {note}")
+                has_fault_notes = True
+            if "启动柴油机" in note and "50" in note:
+                fault_triggered = True
+
+    assert not fault_triggered, "检测到因未定义源触发了柴油机启动(50元启动费)!"
+    print(f"  [OK] 未定义wt1未触发故障预案，也没有产生柴油机启动费")
+
+    assert len(report.step_records) > 0
+    first_step = report.step_records[0]
+
+    assert "wt1" in first_step.wt_output
+    assert first_step.wt_output["wt1"] == 0.0
+    print(f"  [OK] wt1出力正确为0，未标记为故障")
+
+    print()
+
+
 def main():
     print()
     print("╔" + "═" * 58 + "╗")
@@ -358,6 +422,7 @@ def main():
         test_real_state_unaffected,
         test_simulation_comparison,
         test_step_records_detail,
+        test_undefined_source_no_fault,
     ]
 
     passed = 0

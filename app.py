@@ -6,11 +6,13 @@ import config
 from models import MicrogridState, SourceReport, LoadReport, SimulationStatus
 from dispatcher import DispatchEngine
 from simulation import SimulationEngine
+from demand_response import DemandResponseManager
 
 app = Flask(__name__)
 
 state = MicrogridState()
-engine = DispatchEngine(state)
+dr_manager = DemandResponseManager(state)
+engine = DispatchEngine(state, dr_manager)
 sim_engine = SimulationEngine(state)
 
 
@@ -421,6 +423,78 @@ def get_accumulated_stats():
     })
 
 
+@app.route("/api/storage/plan", methods=["GET"])
+def get_storage_plan():
+    """
+    查询当前生效的储能计划
+    """
+    report = state.get_storage_plan_report()
+    return jsonify({
+        "status": "ok",
+        "plan": report,
+        "query_time": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/storage/plan/regenerate", methods=["POST"])
+def regenerate_storage_plan():
+    """
+    手动触发重新生成储能计划
+    """
+    now = datetime.now()
+    plan = state.generate_storage_plan(now)
+    report = state.get_storage_plan_report()
+    return jsonify({
+        "status": "ok",
+        "message": f"储能计划已重新生成，计划日期: {plan.plan_date}",
+        "plan": report,
+        "generated_at": now.isoformat(),
+    })
+
+
+@app.route("/api/storage/plan/generation-time", methods=["PUT"])
+def update_plan_generation_time():
+    """
+    修改储能计划生成时刻
+    请求体: {"hour": 0, "minute": 30}
+    """
+    data = request.get_json(force=True) or {}
+    hour = data.get("hour")
+    minute = data.get("minute")
+
+    if hour is None or minute is None:
+        return jsonify({"error": "缺少必填字段: hour, minute"}), 400
+
+    try:
+        hour = int(hour)
+        minute = int(minute)
+    except (ValueError, TypeError):
+        return jsonify({"error": "hour 和 minute 必须是整数"}), 400
+
+    success = state.update_plan_generation_time(hour, minute)
+    if not success:
+        return jsonify({"error": "hour 必须在 [0,23]，minute 必须在 [0,59]"}), 400
+
+    return jsonify({
+        "status": "ok",
+        "message": f"计划生成时刻已更新为 {hour:02d}:{minute:02d}",
+        "plan_generation_time": f"{hour:02d}:{minute:02d}",
+    })
+
+
+@app.route("/api/storage/arbitrage/stats", methods=["GET"])
+def get_arbitrage_stats():
+    """
+    查询储能套利统计
+    """
+    report = state.get_arbitrage_stats_report()
+    return jsonify({
+        "status": "ok",
+        "arbitrage_stats": report,
+        "query_time": datetime.now().isoformat(),
+    })
+
+
 @app.route("/api/alerts", methods=["GET"])
 def get_alerts():
     """查询告警记录"""
@@ -593,6 +667,440 @@ def get_fault_events():
         "total": len(state.fault_events),
         "returned": len(events),
         "events": events,
+    })
+
+
+@app.route("/api/dr/interruptible-loads", methods=["GET"])
+def list_interruptible_loads():
+    loads = dr_manager.list_interruptible_loads()
+    result = []
+    for load in loads:
+        result.append({
+            "load_id": load.load_id,
+            "name": load.name,
+            "rated_power_kw": load.rated_power_kw,
+            "max_reduction_ratio": load.max_reduction_ratio,
+            "max_reduction_kw": load.get_max_reduction_kw(),
+            "min_duration_minutes": load.min_duration_minutes,
+            "cooldown_minutes": load.cooldown_minutes,
+            "unit_cost_yuan_per_kwh": load.unit_cost_yuan_per_kwh,
+            "current_reduction_kw": load.current_reduction_kw,
+            "created_at": load.created_at.isoformat(),
+        })
+    return jsonify({"status": "ok", "loads": result, "total": len(result)})
+
+
+@app.route("/api/dr/interruptible-loads", methods=["POST"])
+def add_interruptible_load():
+    data = request.get_json(force=True)
+    required = ["name", "rated_power_kw", "max_reduction_ratio",
+                "min_duration_minutes", "cooldown_minutes", "unit_cost_yuan_per_kwh"]
+    for f in required:
+        if f not in data:
+            return jsonify({"error": f"缺少必填字段: {f}"}), 400
+
+    try:
+        load = dr_manager.add_interruptible_load(data)
+        return jsonify({
+            "status": "ok",
+            "message": "可中断负荷已添加",
+            "load": {
+                "load_id": load.load_id,
+                "name": load.name,
+                "rated_power_kw": load.rated_power_kw,
+                "max_reduction_ratio": load.max_reduction_ratio,
+                "min_duration_minutes": load.min_duration_minutes,
+                "cooldown_minutes": load.cooldown_minutes,
+                "unit_cost_yuan_per_kwh": load.unit_cost_yuan_per_kwh,
+            }
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/dr/interruptible-loads/<load_id>", methods=["GET"])
+def get_interruptible_load(load_id):
+    load = dr_manager.get_interruptible_load(load_id)
+    if not load:
+        return jsonify({"error": "可中断负荷不存在"}), 404
+    return jsonify({
+        "status": "ok",
+        "load": {
+            "load_id": load.load_id,
+            "name": load.name,
+            "rated_power_kw": load.rated_power_kw,
+            "max_reduction_ratio": load.max_reduction_ratio,
+            "max_reduction_kw": load.get_max_reduction_kw(),
+            "min_duration_minutes": load.min_duration_minutes,
+            "cooldown_minutes": load.cooldown_minutes,
+            "unit_cost_yuan_per_kwh": load.unit_cost_yuan_per_kwh,
+            "current_reduction_kw": load.current_reduction_kw,
+            "can_reduce_now": load.can_reduce(datetime.now()),
+        }
+    })
+
+
+@app.route("/api/dr/interruptible-loads/<load_id>", methods=["PUT"])
+def update_interruptible_load(load_id):
+    data = request.get_json(force=True) or {}
+    load = dr_manager.update_interruptible_load(load_id, data)
+    if not load:
+        return jsonify({"error": "可中断负荷不存在"}), 404
+    return jsonify({
+        "status": "ok",
+        "message": "可中断负荷已更新",
+        "load": {
+            "load_id": load.load_id,
+            "name": load.name,
+            "rated_power_kw": load.rated_power_kw,
+            "max_reduction_ratio": load.max_reduction_ratio,
+            "min_duration_minutes": load.min_duration_minutes,
+            "cooldown_minutes": load.cooldown_minutes,
+            "unit_cost_yuan_per_kwh": load.unit_cost_yuan_per_kwh,
+        }
+    })
+
+
+@app.route("/api/dr/interruptible-loads/<load_id>", methods=["DELETE"])
+def delete_interruptible_load(load_id):
+    success = dr_manager.delete_interruptible_load(load_id)
+    if not success:
+        return jsonify({"error": "可中断负荷不存在"}), 404
+    return jsonify({"status": "ok", "message": "可中断负荷已删除", "load_id": load_id})
+
+
+@app.route("/api/dr/events", methods=["POST"])
+def receive_dr_event():
+    data = request.get_json(force=True)
+    required = ["start_time", "end_time", "target_load_kw",
+                "subsidy_unit_price", "penalty_unit_price"]
+    for f in required:
+        if f not in data:
+            return jsonify({"error": f"缺少必填字段: {f}"}), 400
+
+    try:
+        event = dr_manager.receive_event(data)
+        plan = dr_manager.generate_response_plan(event.event_id)
+        return jsonify({
+            "status": "ok",
+            "message": "需求响应事件已接收，已生成响应方案",
+            "event": {
+                "event_id": event.event_id,
+                "event_no": event.event_no,
+                "start_time": event.start_time.isoformat(),
+                "end_time": event.end_time.isoformat(),
+                "target_load_kw": event.target_load_kw,
+                "subsidy_unit_price": event.subsidy_unit_price,
+                "penalty_unit_price": event.penalty_unit_price,
+                "status": event.status,
+                "received_at": event.received_at.isoformat(),
+            },
+            "plan": {
+                "plan_id": plan.plan_id if plan else None,
+                "total_reduction_target_kw": plan.total_reduction_target_kw if plan else 0,
+                "is_partial_response": plan.is_partial_response if plan else False,
+                "expected_gap_kw": plan.expected_gap_kw if plan else 0,
+                "notes": plan.notes if plan else [],
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/dr/events", methods=["GET"])
+def list_dr_events():
+    status = request.args.get("status")
+    events = dr_manager.list_events(status)
+    result = []
+    for event in events:
+        result.append({
+            "event_id": event.event_id,
+            "event_no": event.event_no,
+            "start_time": event.start_time.isoformat(),
+            "end_time": event.end_time.isoformat(),
+            "target_load_kw": event.target_load_kw,
+            "subsidy_unit_price": event.subsidy_unit_price,
+            "penalty_unit_price": event.penalty_unit_price,
+            "status": event.status,
+            "status_chinese": _get_event_status_chinese(event.status),
+            "received_at": event.received_at.isoformat(),
+            "confirmed_at": event.confirmed_at.isoformat() if event.confirmed_at else None,
+            "finished_at": event.finished_at.isoformat() if event.finished_at else None,
+            "early_terminated": event.early_terminated,
+        })
+    return jsonify({"status": "ok", "events": result, "total": len(result)})
+
+
+def _get_event_status_chinese(status):
+    status_map = {
+        "pending": "待响应",
+        "confirmed": "已确认",
+        "active": "响应中",
+        "finished": "已结束",
+    }
+    return status_map.get(status, status)
+
+
+@app.route("/api/dr/events/<event_id>", methods=["GET"])
+def get_dr_event(event_id):
+    event = dr_manager.get_event(event_id)
+    if not event:
+        return jsonify({"error": "需求响应事件不存在"}), 404
+    return jsonify({
+        "status": "ok",
+        "event": {
+            "event_id": event.event_id,
+            "event_no": event.event_no,
+            "start_time": event.start_time.isoformat(),
+            "end_time": event.end_time.isoformat(),
+            "target_load_kw": event.target_load_kw,
+            "subsidy_unit_price": event.subsidy_unit_price,
+            "penalty_unit_price": event.penalty_unit_price,
+            "status": event.status,
+            "status_chinese": _get_event_status_chinese(event.status),
+            "received_at": event.received_at.isoformat(),
+            "confirmed_at": event.confirmed_at.isoformat() if event.confirmed_at else None,
+            "finished_at": event.finished_at.isoformat() if event.finished_at else None,
+            "early_terminated": event.early_terminated,
+            "termination_reason": event.termination_reason,
+            "current_plan_id": event.current_plan_id,
+            "settlement_report_id": event.settlement_report_id,
+        }
+    })
+
+
+@app.route("/api/dr/events/<event_id>/plan", methods=["GET"])
+def get_dr_response_plan(event_id):
+    event = dr_manager.get_event(event_id)
+    if not event:
+        return jsonify({"error": "需求响应事件不存在"}), 404
+    if not event.current_plan_id:
+        return jsonify({"error": "该事件暂无响应方案"}), 404
+
+    plan = dr_manager.get_plan(event.current_plan_id)
+    if not plan:
+        return jsonify({"error": "响应方案不存在"}), 404
+
+    schedule = []
+    for period in plan.schedule:
+        schedule.append({
+            "period_start": period.period_start.isoformat(),
+            "period_end": period.period_end.isoformat(),
+            "load_reductions": period.load_reductions,
+            "battery_discharge_kw": period.battery_discharge_kw,
+            "total_reduction_kw": period.total_reduction_kw,
+            "target_load_kw": period.target_load_kw,
+            "estimated_load_kw": period.estimated_load_kw,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "plan": {
+            "plan_id": plan.plan_id,
+            "event_id": plan.event_id,
+            "generated_at": plan.generated_at.isoformat(),
+            "status": plan.status,
+            "total_reduction_target_kw": plan.total_reduction_target_kw,
+            "is_partial_response": plan.is_partial_response,
+            "expected_gap_kw": plan.expected_gap_kw,
+            "schedule_count": len(plan.schedule),
+            "notes": plan.notes,
+            "schedule": schedule,
+        }
+    })
+
+
+@app.route("/api/dr/events/<event_id>/confirm", methods=["POST"])
+def confirm_dr_plan(event_id):
+    event = dr_manager.get_event(event_id)
+    if not event:
+        return jsonify({"error": "需求响应事件不存在"}), 404
+
+    if not event.current_plan_id:
+        return jsonify({"error": "该事件暂无响应方案，无法确认"}), 400
+
+    success = dr_manager.confirm_plan(event_id)
+    if not success:
+        return jsonify({"error": "确认失败，事件状态不正确或无方案"}), 400
+
+    return jsonify({
+        "status": "ok",
+        "message": "响应方案已确认，等待事件开始时间自动生效",
+        "event_id": event_id,
+        "event_status": "confirmed",
+    })
+
+
+@app.route("/api/dr/events/<event_id>/records", methods=["GET"])
+def get_dr_execution_records(event_id):
+    event = dr_manager.get_event(event_id)
+    if not event:
+        return jsonify({"error": "需求响应事件不存在"}), 404
+
+    try:
+        limit = int(request.args.get("limit", 100))
+        offset = int(request.args.get("offset", 0))
+    except ValueError:
+        return jsonify({"error": "limit 和 offset 必须是整数"}), 400
+
+    records = dr_manager.get_event_execution_records(event_id)
+    total = len(records)
+    sliced = records[-limit - offset: len(records) - offset] if offset > 0 else records[-limit:]
+    sliced = list(reversed(sliced))
+
+    result = []
+    for rec in sliced:
+        result.append({
+            "record_id": rec.record_id,
+            "timestamp": rec.timestamp.isoformat(),
+            "actual_load_kw": rec.actual_load_kw,
+            "target_load_kw": rec.target_load_kw,
+            "total_reduction_kw": rec.total_reduction_kw,
+            "load_reductions": rec.load_reductions,
+            "battery_discharge_kw": rec.battery_discharge_kw,
+            "is_compliant": rec.is_compliant,
+            "gap_kw": rec.gap_kw,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "event_id": event_id,
+        "total": total,
+        "returned": len(result),
+        "records": result,
+    })
+
+
+@app.route("/api/dr/events/<event_id>/settlement", methods=["GET"])
+def get_dr_settlement(event_id):
+    event = dr_manager.get_event(event_id)
+    if not event:
+        return jsonify({"error": "需求响应事件不存在"}), 404
+
+    report = dr_manager.get_settlement_report(event_id)
+    if not report:
+        return jsonify({"error": "该事件尚无结算报告"}), 404
+
+    settlement_type_chinese = {
+        "full": "全额补贴",
+        "partial": "部分补贴(80%)",
+        "penalty": "考核罚款",
+        "none": "无",
+    }
+
+    return jsonify({
+        "status": "ok",
+        "settlement": {
+            "report_id": report.report_id,
+            "event_id": report.event_id,
+            "generated_at": report.generated_at.isoformat(),
+            "start_time": report.start_time.isoformat(),
+            "end_time": report.end_time.isoformat(),
+            "total_periods": report.total_periods,
+            "compliant_periods": report.compliant_periods,
+            "compliance_rate": round(report.compliance_rate * 100, 2),
+            "compliance_rate_percent": f"{report.compliance_rate * 100:.2f}%",
+            "total_reduction_kwh": round(report.total_reduction_kwh, 4),
+            "total_gap_kwh": round(report.total_gap_kwh, 4),
+            "subsidy_unit_price": report.subsidy_unit_price,
+            "penalty_unit_price": report.penalty_unit_price,
+            "subsidy_amount": round(report.subsidy_amount, 2),
+            "penalty_amount": round(report.penalty_amount, 2),
+            "net_amount": round(report.net_amount, 2),
+            "settlement_type": report.settlement_type,
+            "settlement_type_chinese": settlement_type_chinese.get(report.settlement_type, report.settlement_type),
+        }
+    })
+
+
+@app.route("/api/dr/events/<event_id>/terminate", methods=["POST"])
+def terminate_dr_event(event_id):
+    data = request.get_json(force=True) or {}
+    reason = data.get("reason", "手动中止")
+
+    report = dr_manager.terminate_event_early(event_id, reason)
+    if not report:
+        return jsonify({"error": "事件不存在或未在执行中，无法中止"}), 400
+
+    return jsonify({
+        "status": "ok",
+        "message": "需求响应事件已提前中止",
+        "event_id": event_id,
+        "termination_reason": reason,
+        "settlement": {
+            "compliance_rate": f"{report.compliance_rate * 100:.2f}%",
+            "subsidy_amount": round(report.subsidy_amount, 2),
+            "penalty_amount": round(report.penalty_amount, 2),
+            "net_amount": round(report.net_amount, 2),
+        }
+    })
+
+
+@app.route("/api/dr/stats", methods=["GET"])
+def get_dr_stats():
+    stats = dr_manager.get_accumulated_stats()
+    return jsonify({
+        "status": "ok",
+        "stats": {
+            "total_events": stats["total_events"],
+            "finished_events": stats["finished_events"],
+            "active_events": stats["active_events"],
+            "pending_events": stats["pending_events"],
+            "total_subsidy": stats["total_subsidy"],
+            "total_penalty": stats["total_penalty"],
+            "net_income": stats["net_income"],
+            "total_reduction_kwh": stats["total_reduction_kwh"],
+        },
+        "query_time": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/dr/current", methods=["GET"])
+def get_current_dr_status():
+    now = datetime.now()
+    dr_info = dr_manager.get_current_reduction(now)
+    active_event = dr_manager.get_active_event(now)
+
+    load_details = []
+    for load_id, reduction_kw in dr_info.get("load_reductions", {}).items():
+        load = dr_manager.get_interruptible_load(load_id)
+        load_details.append({
+            "load_id": load_id,
+            "name": load.name if load else load_id,
+            "reduction_kw": reduction_kw,
+        })
+
+    all_active_events = [e for e in dr_manager.events.values() if e.status == "active"]
+    active_event_details = []
+    for e in all_active_events:
+        active_event_details.append({
+            "event_id": e.event_id,
+            "event_no": e.event_no,
+            "start_time": e.start_time.isoformat(),
+            "end_time": e.end_time.isoformat(),
+            "target_load_kw": e.target_load_kw,
+            "in_time_window": e.start_time <= now <= e.end_time,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "current_dr": {
+            "active": dr_info.get("active", False),
+            "event_id": dr_info.get("event_id"),
+            "event_no": active_event.event_no if active_event else None,
+            "target_load_kw": dr_info.get("target_load_kw", 0),
+            "current_load_kw": dr_manager.get_current_load_kw(),
+            "total_reduction_kw": sum(dr_info.get("load_reductions", {}).values()) + dr_info.get("battery_discharge_kw", 0),
+            "load_reductions": load_details,
+            "battery_discharge_kw": dr_info.get("battery_discharge_kw", 0),
+            "debug_reason": dr_info.get("debug_reason"),
+        },
+        "debug": {
+            "now": now.isoformat(),
+            "all_active_events": active_event_details,
+            "active_event_count": len(all_active_events),
+        },
+        "query_time": now.isoformat(),
     })
 
 
@@ -1006,6 +1514,10 @@ def _list_endpoints():
         "GET /api/status/load - 负荷状态",
         "GET /api/dispatch/history - 调度历史",
         "GET /api/stats/accumulated - 累计统计",
+        "GET /api/storage/plan - 查询储能计划",
+        "POST /api/storage/plan/regenerate - 重新生成储能计划",
+        "PUT /api/storage/plan/generation-time - 修改储能计划生成时刻",
+        "GET /api/storage/arbitrage/stats - 储能套利统计",
         "GET /api/alerts - 告警记录",
         "GET /api/source/health - 所有发电源健康评分",
         "GET /api/source/health/<type>/<id> - 单个发电源健康评分",
@@ -1014,6 +1526,21 @@ def _list_endpoints():
         "GET /api/backup-plans - 备用预案列表",
         "GET /api/backup-plans/<type>/<id> - 单源备用预案",
         "GET /api/fault-events - 故障事件记录",
+        "GET /api/dr/interruptible-loads - 查询可中断负荷列表",
+        "POST /api/dr/interruptible-loads - 添加可中断负荷",
+        "GET /api/dr/interruptible-loads/<id> - 查询可中断负荷详情",
+        "PUT /api/dr/interruptible-loads/<id> - 更新可中断负荷",
+        "DELETE /api/dr/interruptible-loads/<id> - 删除可中断负荷",
+        "POST /api/dr/events - 接收需求响应事件",
+        "GET /api/dr/events - 查询需求响应事件列表",
+        "GET /api/dr/events/<id> - 查询需求响应事件详情",
+        "GET /api/dr/events/<id>/plan - 查询响应方案",
+        "POST /api/dr/events/<id>/confirm - 确认响应方案",
+        "GET /api/dr/events/<id>/records - 查询执行记录",
+        "GET /api/dr/events/<id>/settlement - 查询结算报告",
+        "POST /api/dr/events/<id>/terminate - 提前终止事件",
+        "GET /api/dr/stats - 需求响应累计统计",
+        "GET /api/dr/current - 当前需求响应状态",
         "PUT /api/config/tariff - 修改电价配置",
         "PUT /api/config/bess_soc - 修改SOC区间",
         "GET /api/config/all - 查看全部配置",
@@ -1042,6 +1569,12 @@ if __name__ == "__main__":
     print(f"柴油发电机: {list(config.DIESEL_CONFIG.keys())}")
     print(f"电池储能: {list(config.BESS_CONFIG.keys())}")
     print(f"初始电池SOC: {config.BESS_CONFIG['bes1']['initial_soc'] * 100:.0f}%")
+    print("-" * 60)
+    print("需求响应模块: 已启用")
+    print(f"  - 可中断负荷: {len(dr_manager.interruptible_loads)} 个")
+    print("  - 事件接收: POST /api/dr/events")
+    print("  - 负荷管理: GET /api/dr/interruptible-loads")
+    print("  - 当前状态: GET /api/dr/current")
     print("-" * 60)
     print("多场景仿真与回测引擎: 已启用")
     print("  - 创建场景: POST /api/simulation/scenarios")
