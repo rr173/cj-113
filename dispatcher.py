@@ -1,12 +1,14 @@
 from datetime import datetime
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 import config
 from models import MicrogridState, DispatchDecision
+from demand_response import DemandResponseManager
 
 
 class DispatchEngine:
-    def __init__(self, state: MicrogridState):
+    def __init__(self, state: MicrogridState, dr_manager: Optional[DemandResponseManager] = None):
         self.state = state
+        self.dr_manager = dr_manager
 
     def _get_time_interval_hours(self, now: datetime) -> float:
         if self.state.last_dispatch_time is None:
@@ -396,6 +398,11 @@ class DispatchEngine:
             grid_buy_price=grid_buy_price,
             notes=notes,
         )
+
+        if self.dr_manager:
+            self.dr_manager.start_event_if_due(now)
+            self.dr_manager.check_and_finish_events(now)
+            decision = self.dr_manager.apply_dr_constraints(decision, now)
 
         self.state.add_dispatch(decision)
         return decision
