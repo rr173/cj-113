@@ -60,6 +60,54 @@ class DischargeRecord:
 
 
 @dataclass
+class SourceHealthRecord:
+    timestamp: datetime
+    available: bool
+    power_kw: float
+    health_score: float
+    status: str
+
+
+@dataclass
+class SourceHealthState:
+    source_id: str
+    source_type: str
+    health_score: float = 100.0
+    status: str = "normal"
+    history: List[SourceHealthRecord] = field(default_factory=list)
+    in_maintenance: bool = False
+    maintenance_started_at: Optional[datetime] = None
+    current_fault: Optional[Dict[str, Any]] = None
+    consecutive_unavailable: int = 0
+
+
+@dataclass
+class BackupPlan:
+    plan_id: str
+    source_id: str
+    source_type: str
+    generated_at: datetime
+    can_cover: bool
+    gap_kw: float = 0.0
+    suggestions: List[str] = field(default_factory=list)
+    alternative_sources: Dict[str, Any] = field(default_factory=dict)
+    load_kw: float = 0.0
+    lost_capacity_kw: float = 0.0
+
+
+@dataclass
+class FaultEvent:
+    event_id: str
+    source_id: str
+    source_type: str
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    duration_minutes: float = 0.0
+    had_plan: bool = False
+    plan_id: Optional[str] = None
+
+
+@dataclass
 class BatteryHealth:
     equivalent_cycles: float = 0.0
     last_cycle_soc_peak: Optional[float] = None
@@ -121,6 +169,12 @@ class AccumulatedStats:
 
 
 class MicrogridState:
+    HEALTH_WINDOW_SIZE = 50
+    HEALTH_WARNING_THRESHOLD = 60.0
+    HEALTH_DANGER_THRESHOLD = 30.0
+    FLUCTUATION_STABLE = 0.10
+    FLUCTUATION_HIGH = 0.30
+
     def __init__(self):
         self.pv_reports: Dict[str, SourceReport] = {}
         self.wt_reports: Dict[str, SourceReport] = {}
@@ -151,6 +205,19 @@ class MicrogridState:
         self.plan_generation_hour: int = config.STORAGE_STRATEGY_CONFIG["plan_generation_hour"]
         self.plan_generation_minute: int = config.STORAGE_STRATEGY_CONFIG["plan_generation_minute"]
 
+        self.source_health: Dict[str, SourceHealthState] = {}
+        for sid in config.PV_CONFIG:
+            self.source_health[f"pv:{sid}"] = SourceHealthState(source_id=sid, source_type="pv")
+        for sid in config.WT_CONFIG:
+            self.source_health[f"wt:{sid}"] = SourceHealthState(source_id=sid, source_type="wt")
+        for sid in config.DIESEL_CONFIG:
+            self.source_health[f"diesel:{sid}"] = SourceHealthState(source_id=sid, source_type="diesel")
+
+        self.backup_plans: Dict[str, BackupPlan] = {}
+        self.fault_events: List[FaultEvent] = []
+        self._fault_event_counter: int = 0
+        self._backup_plan_counter: int = 0
+
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
             self.pv_reports[report.source_id] = report
@@ -158,6 +225,14 @@ class MicrogridState:
             self.wt_reports[report.source_id] = report
         elif report.source_type == "diesel":
             self.diesel_reports[report.source_id] = report
+
+        health_key = f"{report.source_type}:{report.source_id}"
+        if health_key in self.source_health:
+            self._update_source_health(health_key, report)
+            self._handle_fault_transition(health_key, report)
+            hs = self.source_health[health_key]
+            if not hs.in_maintenance and hs.status in ("warning", "danger"):
+                self._generate_backup_plan(health_key)
 
     def report_load(self, report: LoadReport):
         self.load_report = report
@@ -657,3 +732,289 @@ class MicrogridState:
     def record_arbitrage_discharge(self, energy_kwh: float, revenue: float):
         self.stats.arbitrage.total_arbitrage_discharge_kwh += energy_kwh
         self.stats.arbitrage.total_arbitrage_revenue += revenue
+
+    def _get_rated_power(self, source_type: str, source_id: str) -> float:
+        if source_type == "pv":
+            return config.PV_CONFIG.get(source_id, {}).get("rated_power", 0.0)
+        elif source_type == "wt":
+            return config.WT_CONFIG.get(source_id, {}).get("rated_power", 0.0)
+        elif source_type == "diesel":
+            return config.DIESEL_CONFIG.get(source_id, {}).get("rated_power", 0.0)
+        return 0.0
+
+    def _compute_fluctuation_penalty(self, health_key: str, report: SourceReport) -> float:
+        hs = self.source_health[health_key]
+        rated = self._get_rated_power(hs.source_type, hs.source_id)
+        if rated <= 0:
+            return 0.0
+
+        recent_available = [h for h in hs.history[-10:] if h.available and h.power_kw > 0]
+        if len(recent_available) < 2:
+            return 0.0
+
+        powers = [h.power_kw for h in recent_available]
+        avg_power = sum(powers) / len(powers)
+        if avg_power <= 0:
+            return 0.0
+
+        max_deviation = max(abs(p - avg_power) for p in powers)
+        fluctuation_ratio = max_deviation / rated
+
+        if fluctuation_ratio > self.FLUCTUATION_HIGH:
+            return 20.0
+        return 0.0
+
+    def _update_source_health(self, health_key: str, report: SourceReport):
+        hs = self.source_health[health_key]
+        if hs.in_maintenance:
+            return
+
+        new_score = 100.0
+
+        if not report.available:
+            hs.consecutive_unavailable += 1
+            if hs.consecutive_unavailable >= 2:
+                new_score = 0.0
+            else:
+                new_score = 60.0
+        else:
+            hs.consecutive_unavailable = 0
+            fluct_penalty = self._compute_fluctuation_penalty(health_key, report)
+            new_score = 100.0 - fluct_penalty
+
+        hs.health_score = max(0.0, min(100.0, new_score))
+
+        if hs.health_score <= self.HEALTH_DANGER_THRESHOLD:
+            new_status = "danger"
+        elif hs.health_score <= self.HEALTH_WARNING_THRESHOLD:
+            new_status = "warning"
+        else:
+            new_status = "normal"
+
+        old_status = hs.status
+        hs.status = new_status
+
+        record = SourceHealthRecord(
+            timestamp=report.timestamp,
+            available=report.available,
+            power_kw=report.power_kw,
+            health_score=hs.health_score,
+            status=hs.status,
+        )
+        hs.history.append(record)
+        if len(hs.history) > self.HEALTH_WINDOW_SIZE:
+            hs.history = hs.history[-self.HEALTH_WINDOW_SIZE:]
+
+        if old_status != new_status and new_status in ("warning", "danger"):
+            level_text = "预警" if new_status == "warning" else "高危"
+            self.add_alert(
+                f"SOURCE_{new_status.upper()}",
+                f"发电源 {report.source_type}:{report.source_id} 进入{level_text}状态，健康评分 {hs.health_score:.1f}",
+                {
+                    "source_type": hs.source_type,
+                    "source_id": hs.source_id,
+                    "health_score": hs.health_score,
+                    "status": hs.status,
+                }
+            )
+
+    def _handle_fault_transition(self, health_key: str, report: SourceReport):
+        hs = self.source_health[health_key]
+        if hs.in_maintenance:
+            return
+
+        if not report.available and hs.current_fault is None:
+            self._fault_event_counter += 1
+            event_id = f"FAULT-{self._fault_event_counter:06d}"
+            plan = self.backup_plans.get(health_key)
+            event = FaultEvent(
+                event_id=event_id,
+                source_id=hs.source_id,
+                source_type=hs.source_type,
+                started_at=report.timestamp,
+                had_plan=plan is not None,
+                plan_id=plan.plan_id if plan else None,
+            )
+            self.fault_events.append(event)
+            hs.current_fault = {"event_id": event_id, "started_at": report.timestamp.isoformat()}
+
+            if plan is None:
+                self.add_alert(
+                    "SOURCE_UNEXPECTED_FAULT",
+                    f"发电源 {hs.source_type}:{hs.source_id} 突发掉线，无预案覆盖，请紧急处理",
+                    {
+                        "source_type": hs.source_type,
+                        "source_id": hs.source_id,
+                        "event_id": event_id,
+                    }
+                )
+
+        if report.available and hs.current_fault is not None:
+            event_id = hs.current_fault["event_id"]
+            for ev in self.fault_events:
+                if ev.event_id == event_id:
+                    ev.ended_at = report.timestamp
+                    ev.duration_minutes = (report.timestamp - ev.started_at).total_seconds() / 60.0
+                    break
+            hs.current_fault = None
+            hs.status = "normal"
+            hs.health_score = 100.0
+            hs.consecutive_unavailable = 0
+
+    def _generate_backup_plan(self, health_key: str):
+        hs = self.source_health[health_key]
+        rated = self._get_rated_power(hs.source_type, hs.source_id)
+        current_load = self.get_load_kw()
+
+        remaining_renewable = 0.0
+        for sid, r in self.pv_reports.items():
+            if f"pv:{sid}" != health_key and r.available:
+                remaining_renewable += max(0.0, r.power_kw)
+        for sid, r in self.wt_reports.items():
+            if f"wt:{sid}" != health_key and r.available:
+                remaining_renewable += max(0.0, r.power_kw)
+
+        self._backup_plan_counter += 1
+        plan_id = f"PLAN-{self._backup_plan_counter:06d}"
+
+        alternatives = {
+            "renewable_kw": round(remaining_renewable, 2),
+            "battery_max_discharge_kw": 0.0,
+            "diesel_max_kw": 0.0,
+            "grid_import_available": True,
+        }
+
+        bes_id = list(config.BESS_CONFIG.keys())[0]
+        ds_id = list(config.DIESEL_CONFIG.keys())[0]
+        time_interval = config.DEFAULT_DISPATCH_INTERVAL_MINUTES / 60.0
+
+        max_batt_discharge = self.get_bess_max_discharge_with_health(bes_id, time_interval)
+        alternatives["battery_max_discharge_kw"] = round(max_batt_discharge, 2)
+
+        now = datetime.now()
+        diesel_cap = self.get_available_diesel_capacity(ds_id, now)
+        alternatives["diesel_max_kw"] = round(diesel_cap.get("max_output", 0.0), 2)
+        alternatives["diesel_can_start"] = diesel_cap.get("can_run", False)
+
+        total_available = remaining_renewable + alternatives["battery_max_discharge_kw"] + alternatives["diesel_max_kw"]
+        gap = max(0.0, current_load - total_available)
+
+        suggestions = []
+        if gap > 0:
+            suggestions.append(f"功率缺口 {gap:.2f}kW")
+            if not alternatives["diesel_can_start"]:
+                suggestions.append("建议提前启动柴油机暖机")
+            cfg = config.BESS_CONFIG[bes_id]
+            bs = self.bess_state[bes_id]
+            if bs.soc < cfg["soc_max"] * 0.9:
+                suggestions.append(f"建议提前将电池充至高SOC (当前 {bs.soc*100:.1f}%)")
+        else:
+            batt_share = min(max_batt_discharge, max(0.0, current_load - remaining_renewable))
+            after_batt = max(0.0, current_load - remaining_renewable - batt_share)
+            diesel_share = min(alternatives["diesel_max_kw"], after_batt)
+            after_diesel = max(0.0, after_batt - diesel_share)
+            grid_share = after_diesel
+
+            alternatives["breakdown"] = {
+                "battery_discharge_kw": round(batt_share, 2),
+                "diesel_output_kw": round(diesel_share, 2),
+                "grid_import_kw": round(grid_share, 2),
+            }
+            suggestions.append("预案可覆盖负荷缺口")
+
+        plan = BackupPlan(
+            plan_id=plan_id,
+            source_id=hs.source_id,
+            source_type=hs.source_type,
+            generated_at=datetime.now(),
+            can_cover=gap <= 0,
+            gap_kw=round(gap, 2),
+            suggestions=suggestions,
+            alternative_sources=alternatives,
+            load_kw=round(current_load, 2),
+            lost_capacity_kw=round(rated, 2),
+        )
+        self.backup_plans[health_key] = plan
+
+    def get_active_backup_plans(self) -> List[BackupPlan]:
+        return [p for p in self.backup_plans.values()]
+
+    def get_backup_plan_for_source(self, health_key: str) -> Optional[BackupPlan]:
+        return self.backup_plans.get(health_key)
+
+    def get_source_health_status(self, health_key: str) -> Optional[Dict[str, Any]]:
+        hs = self.source_health.get(health_key)
+        if hs is None:
+            return None
+        return {
+            "source_type": hs.source_type,
+            "source_id": hs.source_id,
+            "health_score": round(hs.health_score, 2),
+            "status": hs.status,
+            "status_chinese": {"normal": "正常", "warning": "预警", "danger": "高危"}.get(hs.status, "未知"),
+            "in_maintenance": hs.in_maintenance,
+            "maintenance_started_at": hs.maintenance_started_at.isoformat() if hs.maintenance_started_at else None,
+            "consecutive_unavailable": hs.consecutive_unavailable,
+            "current_fault": hs.current_fault,
+            "history_count": len(hs.history),
+        }
+
+    def get_source_health_history(self, health_key: str, limit: int = 50) -> List[Dict[str, Any]]:
+        hs = self.source_health.get(health_key)
+        if hs is None:
+            return []
+        history = hs.history[-limit:]
+        return [
+            {
+                "timestamp": r.timestamp.isoformat(),
+                "available": r.available,
+                "power_kw": r.power_kw,
+                "health_score": round(r.health_score, 2),
+                "status": r.status,
+            }
+            for r in history
+        ]
+
+    def set_source_maintenance(self, health_key: str, in_maintenance: bool) -> bool:
+        hs = self.source_health.get(health_key)
+        if hs is None:
+            return False
+        hs.in_maintenance = in_maintenance
+        if in_maintenance:
+            hs.maintenance_started_at = datetime.now()
+            hs.status = "normal"
+            hs.health_score = 100.0
+            hs.consecutive_unavailable = 0
+            hs.current_fault = None
+            if health_key in self.backup_plans:
+                del self.backup_plans[health_key]
+            self.add_alert(
+                "SOURCE_MAINTENANCE_START",
+                f"发电源 {hs.source_type}:{hs.source_id} 进入维护状态",
+                {"source_type": hs.source_type, "source_id": hs.source_id}
+            )
+        else:
+            hs.maintenance_started_at = None
+            self.add_alert(
+                "SOURCE_MAINTENANCE_END",
+                f"发电源 {hs.source_type}:{hs.source_id} 结束维护状态",
+                {"source_type": hs.source_type, "source_id": hs.source_id}
+            )
+        return True
+
+    def get_fault_events(self, limit: int = 100) -> List[Dict[str, Any]]:
+        events = self.fault_events[-limit:]
+        result = []
+        for ev in reversed(events):
+            result.append({
+                "event_id": ev.event_id,
+                "source_type": ev.source_type,
+                "source_id": ev.source_id,
+                "started_at": ev.started_at.isoformat(),
+                "ended_at": ev.ended_at.isoformat() if ev.ended_at else None,
+                "duration_minutes": round(ev.duration_minutes, 2) if ev.ended_at else None,
+                "still_active": ev.ended_at is None,
+                "had_plan": ev.had_plan,
+                "plan_id": ev.plan_id,
+            })
+        return result
