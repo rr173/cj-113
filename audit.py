@@ -5,7 +5,8 @@ from dataclasses import asdict
 import config
 from models import (
     AuditLog, InputSnapshot, DecisionBranch, OutputSummary,
-    AnomalyMarker, MicrogridState, DispatchDecision
+    AnomalyMarker, MicrogridState, DispatchDecision,
+    CostAttribution, MissedOpportunity
 )
 
 
@@ -448,3 +449,170 @@ class DecisionComparator:
                 explanations.append(f"电价上涨{input_abs:.2f}元/kWh，导致总成本增加{output_abs:.2f}元")
 
         return explanations[0] if explanations else None
+
+
+class CostAttributionAnalyzer:
+    def __init__(self, state: MicrogridState, decision: DispatchDecision,
+                 dispatch_id: str, now: datetime, time_interval_hours: float,
+                 diesel_startup_occurred: bool = False):
+        self.state = state
+        self.decision = decision
+        self.dispatch_id = dispatch_id
+        self.now = now
+        self.time_interval_hours = time_interval_hours
+        self.diesel_startup_occurred = diesel_startup_occurred
+
+    def compute_attribution(self) -> CostAttribution:
+        grid_purchase_cost = self._compute_grid_purchase_cost()
+        diesel_gen_cost, diesel_startup_cost = self._compute_diesel_cost()
+        load_shed_penalty = self._compute_load_shed_penalty()
+        bess_loss_cost = self._compute_bess_loss_cost()
+        feed_in_revenue = self._compute_feed_in_revenue()
+
+        total_comprehensive = (grid_purchase_cost + diesel_gen_cost + diesel_startup_cost +
+                               load_shed_penalty + bess_loss_cost - feed_in_revenue)
+
+        attribution_id = self.state.generate_cost_attribution_id()
+
+        details = {
+            "grid_import_kwh": self.decision.grid_import_kw * self.time_interval_hours,
+            "grid_buy_price": self.decision.grid_buy_price,
+            "diesel_output_kwh": sum(self.decision.diesel_output.values()) * self.time_interval_hours,
+            "load_shed_kwh": self.decision.load_shed_kw * self.time_interval_hours,
+            "feed_in_kwh": self.decision.grid_export_kw * self.time_interval_hours,
+            "tariff_period": self.decision.tariff_period,
+        }
+
+        return CostAttribution(
+            attribution_id=attribution_id,
+            dispatch_id=self.dispatch_id,
+            timestamp=self.now,
+            grid_purchase_cost=round(grid_purchase_cost, 4),
+            diesel_generation_cost=round(diesel_gen_cost, 4),
+            diesel_startup_cost=round(diesel_startup_cost, 4),
+            load_shed_penalty_cost=round(load_shed_penalty, 4),
+            bess_loss_cost=round(bess_loss_cost, 4),
+            feed_in_revenue=round(feed_in_revenue, 4),
+            total_comprehensive_cost=round(total_comprehensive, 4),
+            details=details,
+        )
+
+    def _compute_grid_purchase_cost(self) -> float:
+        return self.decision.grid_import_kw * self.time_interval_hours * self.decision.grid_buy_price
+
+    def _compute_diesel_cost(self) -> Tuple[float, float]:
+        ds_id = list(config.DIESEL_CONFIG.keys())[0]
+        diesel_cfg = config.DIESEL_CONFIG[ds_id]
+        total_diesel_kw = sum(self.decision.diesel_output.values())
+        gen_cost = total_diesel_kw * self.time_interval_hours * diesel_cfg["generation_cost"]
+        startup_cost = diesel_cfg["startup_cost"] if self.diesel_startup_occurred else 0.0
+        return gen_cost, startup_cost
+
+    def _compute_load_shed_penalty(self) -> float:
+        penalty_per_kwh = config.COST_ATTRIBUTION_CONFIG["load_shed_penalty_per_kwh"]
+        shed_kwh = self.decision.load_shed_kw * self.time_interval_hours
+        return shed_kwh * penalty_per_kwh
+
+    def _compute_bess_loss_cost(self) -> float:
+        bes_id = list(config.BESS_CONFIG.keys())[0]
+        bess_cfg = config.BESS_CONFIG[bes_id]
+        bess_action = self.decision.bess_action.get(bes_id, {})
+
+        charge_kw = bess_action.get("charge_kw", 0.0)
+        discharge_kw = bess_action.get("discharge_kw", 0.0)
+
+        charge_eff = bess_cfg["charge_efficiency"]
+        discharge_eff = bess_cfg["discharge_efficiency"]
+
+        loss_cost = 0.0
+
+        if charge_kw > 0:
+            charge_energy_kwh = charge_kw * self.time_interval_hours
+            loss_kwh = charge_energy_kwh * (1.0 - charge_eff)
+            loss_cost += loss_kwh * self.decision.grid_buy_price
+
+        if discharge_kw > 0:
+            discharge_energy_kwh = discharge_kw * self.time_interval_hours
+            battery_energy_used = discharge_energy_kwh / discharge_eff
+            loss_kwh = battery_energy_used - discharge_energy_kwh
+            loss_cost += loss_kwh * self.decision.grid_buy_price
+
+        return loss_cost
+
+    def _compute_feed_in_revenue(self) -> float:
+        return self.decision.grid_export_kw * self.time_interval_hours * config.FEED_IN_TARIFF
+
+    def compute_missed_opportunity(self) -> MissedOpportunity:
+        high_soc_savings = self._compute_high_soc_savings()
+        valley_hour_savings = self._compute_valley_hour_savings()
+        total_missed = high_soc_savings + valley_hour_savings
+
+        opportunity_id = self.state.generate_missed_opportunity_id()
+
+        details = {
+            "current_soc": self._get_current_soc(),
+            "target_soc": config.COST_ATTRIBUTION_CONFIG["missed_opportunity_soc_target"],
+            "current_tariff_period": self.decision.tariff_period,
+            "valley_price": config.get_valley_price(),
+            "current_price": self.decision.grid_buy_price,
+        }
+
+        return MissedOpportunity(
+            opportunity_id=opportunity_id,
+            dispatch_id=self.dispatch_id,
+            timestamp=self.now,
+            high_soc_savings=round(high_soc_savings, 4),
+            valley_hour_savings=round(valley_hour_savings, 4),
+            total_missed_savings=round(total_missed, 4),
+            details=details,
+        )
+
+    def _get_current_soc(self) -> float:
+        bes_id = list(config.BESS_CONFIG.keys())[0]
+        bess_action = self.decision.bess_action.get(bes_id, {})
+        return bess_action.get("soc_before", 0.0)
+
+    def _compute_high_soc_savings(self) -> float:
+        bes_id = list(config.BESS_CONFIG.keys())[0]
+        bess_cfg = config.BESS_CONFIG[bes_id]
+
+        target_soc = config.COST_ATTRIBUTION_CONFIG["missed_opportunity_soc_target"]
+        target_soc = min(target_soc, bess_cfg["soc_max"])
+
+        current_soc = self._get_current_soc()
+        if current_soc >= target_soc:
+            return 0.0
+
+        if self.decision.grid_import_kw <= 0:
+            return 0.0
+
+        capacity_kwh = bess_cfg["capacity_kwh"]
+        extra_energy_avail = (target_soc - current_soc) * capacity_kwh * bess_cfg["discharge_efficiency"]
+        extra_power_avail = extra_energy_avail / self.time_interval_hours
+
+        grid_reduced = min(self.decision.grid_import_kw, extra_power_avail)
+        savings = grid_reduced * self.time_interval_hours * self.decision.grid_buy_price
+
+        return max(0.0, savings)
+
+    def _compute_valley_hour_savings(self) -> float:
+        current_period = self.decision.tariff_period
+        if current_period == "valley":
+            return 0.0
+
+        if self.decision.grid_import_kw <= 0:
+            return 0.0
+
+        valley_price = config.get_valley_price()
+        current_price = self.decision.grid_buy_price
+
+        if current_price <= valley_price:
+            return 0.0
+
+        price_diff = current_price - valley_price
+        savings = self.decision.grid_import_kw * self.time_interval_hours * price_diff
+
+        return max(0.0, savings)
+
+    def update_load_shed_penalty(self, new_penalty_per_kwh: float):
+        config.COST_ATTRIBUTION_CONFIG["load_shed_penalty_per_kwh"] = new_penalty_per_kwh

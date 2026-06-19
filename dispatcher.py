@@ -4,7 +4,7 @@ import config
 from models import MicrogridState, DispatchDecision, AuditLog
 from demand_response import DemandResponseManager
 from price_forecast import PriceForecastManager
-from audit import AuditBuilder, AnomalyDetector
+from audit import AuditBuilder, AnomalyDetector, CostAttributionAnalyzer
 
 
 class DispatchEngine:
@@ -112,6 +112,7 @@ class DispatchEngine:
         load_shed_kw = 0.0
         notes = []
         total_cost = 0.0
+        diesel_startup_occurred = False
         arbitrage_charge_kwh = 0.0
         arbitrage_charge_cost = 0.0
         arbitrage_discharge_kwh = 0.0
@@ -302,6 +303,7 @@ class DispatchEngine:
                             startup_cost = config.DIESEL_CONFIG[ds_id]["startup_cost"]
                             total_cost += startup_cost
                             self.state.start_diesel(ds_id, now)
+                            diesel_startup_occurred = True
                             notes.append(f"启动柴油机 (固定成本 {startup_cost}元)，出力 {diesel_kw:.2f}kW")
                             audit_builder.add_branch(
                                 "柴油机启动决策",
@@ -751,6 +753,7 @@ class DispatchEngine:
                                 startup_cost = config.DIESEL_CONFIG[ds_id]["startup_cost"]
                                 total_cost += startup_cost
                                 self.state.start_diesel(ds_id, now)
+                                diesel_startup_occurred = True
                                 notes.append(f"启动柴油机 (固定成本 {startup_cost}元)，出力 {diesel_kw:.2f}kW")
                                 audit_builder.add_branch(
                                     "柴油机启动决策",
@@ -1122,5 +1125,19 @@ class DispatchEngine:
         audit_log.anomalies = anomalies
 
         self.state.add_audit_log(audit_log)
+
+        cost_analyzer = CostAttributionAnalyzer(
+            state=self.state,
+            decision=decision,
+            dispatch_id=dispatch_id,
+            now=now,
+            time_interval_hours=time_interval_hours,
+            diesel_startup_occurred=diesel_startup_occurred
+        )
+        cost_attribution = cost_analyzer.compute_attribution()
+        self.state.add_cost_attribution(cost_attribution)
+
+        missed_opportunity = cost_analyzer.compute_missed_opportunity()
+        self.state.add_missed_opportunity(missed_opportunity)
 
         return decision

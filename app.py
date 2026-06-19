@@ -283,6 +283,258 @@ def compare_audits():
     })
 
 
+def _cost_attribution_to_dict(attr):
+    return {
+        "attribution_id": attr.attribution_id,
+        "dispatch_id": attr.dispatch_id,
+        "timestamp": attr.timestamp.isoformat(),
+        "grid_purchase_cost": attr.grid_purchase_cost,
+        "diesel_generation_cost": attr.diesel_generation_cost,
+        "diesel_startup_cost": attr.diesel_startup_cost,
+        "load_shed_penalty_cost": attr.load_shed_penalty_cost,
+        "bess_loss_cost": attr.bess_loss_cost,
+        "feed_in_revenue": attr.feed_in_revenue,
+        "total_comprehensive_cost": attr.total_comprehensive_cost,
+        "details": attr.details,
+    }
+
+
+def _missed_opportunity_to_dict(opp):
+    return {
+        "opportunity_id": opp.opportunity_id,
+        "dispatch_id": opp.dispatch_id,
+        "timestamp": opp.timestamp.isoformat(),
+        "high_soc_savings": opp.high_soc_savings,
+        "valley_hour_savings": opp.valley_hour_savings,
+        "total_missed_savings": opp.total_missed_savings,
+        "details": opp.details,
+    }
+
+
+@app.route("/api/cost-attribution/by-dispatch/<dispatch_id>", methods=["GET"])
+def get_cost_attribution_by_dispatch(dispatch_id):
+    """
+    查询单次调度的成本归因明细（通过调度ID关联）
+    """
+    attribution = state.get_cost_attribution_by_dispatch_id(dispatch_id)
+    if attribution is None:
+        return jsonify({"error": f"未找到调度ID对应的成本归因: {dispatch_id}"}), 404
+
+    opportunity = state.get_missed_opportunity_by_dispatch_id(dispatch_id)
+
+    return jsonify({
+        "status": "ok",
+        "cost_attribution": _cost_attribution_to_dict(attribution),
+        "missed_opportunity": _missed_opportunity_to_dict(opportunity) if opportunity else None,
+    })
+
+
+@app.route("/api/cost-attribution/summary", methods=["GET"])
+def get_cost_attribution_summary():
+    """
+    按时间段聚合的成本归因报告
+    参数:
+      - start_time: 开始时间 (ISO格式，可选)
+      - end_time: 结束时间 (ISO格式，可选)
+    """
+    try:
+        start_time_str = request.args.get("start_time")
+        end_time_str = request.args.get("end_time")
+
+        start_time = datetime.fromisoformat(start_time_str) if start_time_str else None
+        end_time = datetime.fromisoformat(end_time_str) if end_time_str else None
+
+        summary = state.compute_cost_attribution_summary(start_time, end_time)
+
+        breakdown = {}
+        total_cost = max(0.0001, summary.total_comprehensive_cost)
+        for key, value in summary.breakdown.items():
+            breakdown[key] = {
+                "amount": round(value, 4),
+                "ratio": round(value / total_cost * 100, 2) if total_cost > 0 else 0.0,
+            }
+
+        return jsonify({
+            "status": "ok",
+            "summary": {
+                "total_grid_purchase_cost": summary.total_grid_purchase_cost,
+                "total_diesel_cost": summary.total_diesel_cost,
+                "total_load_shed_penalty": summary.total_load_shed_penalty,
+                "total_bess_loss_cost": summary.total_bess_loss_cost,
+                "total_feed_in_revenue": summary.total_feed_in_revenue,
+                "total_comprehensive_cost": summary.total_comprehensive_cost,
+                "total_missed_savings": summary.total_missed_savings,
+                "dispatch_count": summary.dispatch_count,
+                "breakdown_with_ratio": breakdown,
+            },
+            "time_range": {
+                "start_time": start_time_str,
+                "end_time": end_time_str,
+            },
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/cost-attribution/trend", methods=["GET"])
+def get_cost_trend():
+    """
+    成本趋势分析（按小时/按天聚合）
+    参数:
+      - granularity: 聚合粒度，可选 hour/day，默认 hour
+      - start_time: 开始时间 (ISO格式，可选)
+      - end_time: 结束时间 (ISO格式，可选)
+    """
+    try:
+        granularity = request.args.get("granularity", "hour")
+        start_time_str = request.args.get("start_time")
+        end_time_str = request.args.get("end_time")
+
+        if granularity not in ("hour", "day"):
+            return jsonify({"error": "granularity 必须是 hour 或 day"}), 400
+
+        start_time = datetime.fromisoformat(start_time_str) if start_time_str else None
+        end_time = datetime.fromisoformat(end_time_str) if end_time_str else None
+
+        trend = state.get_cost_trend(granularity, start_time, end_time)
+
+        return jsonify({
+            "status": "ok",
+            "granularity": granularity,
+            "data_points": len(trend),
+            "trend": trend,
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/cost-attribution/top-expensive", methods=["GET"])
+def get_top_expensive_dispatches():
+    """
+    查询最贵的N次调度（按综合成本排序返回top N）
+    参数:
+      - n: 返回数量，默认10，最大100
+    """
+    try:
+        n = int(request.args.get("n", 10))
+        n = min(max(1, n), 100)
+    except ValueError:
+        return jsonify({"error": "n 必须是整数"}), 400
+
+    top_dispatches = state.get_top_n_expensive_dispatches(n)
+
+    result = []
+    for attr in top_dispatches:
+        opp = state.get_missed_opportunity_by_dispatch_id(attr.dispatch_id)
+        result.append({
+            "cost_attribution": _cost_attribution_to_dict(attr),
+            "missed_opportunity": _missed_opportunity_to_dict(opp) if opp else None,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "requested_count": n,
+        "returned_count": len(result),
+        "top_dispatches": result,
+    })
+
+
+@app.route("/api/cost-attribution/config/shed-penalty", methods=["GET"])
+def get_shed_penalty_config():
+    """
+    查询甩负荷惩罚系数配置
+    """
+    return jsonify({
+        "status": "ok",
+        "config": {
+            "load_shed_penalty_per_kwh": config.COST_ATTRIBUTION_CONFIG["load_shed_penalty_per_kwh"],
+        },
+    })
+
+
+@app.route("/api/cost-attribution/config/shed-penalty", methods=["PUT"])
+def update_shed_penalty_config():
+    """
+    修改甩负荷惩罚系数，修改后只影响新产生的归因记录，不追溯历史
+    请求体: {
+        "load_shed_penalty_per_kwh": 3.0
+    }
+    """
+    data = request.get_json(force=True) or {}
+
+    if "load_shed_penalty_per_kwh" not in data:
+        return jsonify({"error": "缺少必填字段: load_shed_penalty_per_kwh"}), 400
+
+    new_penalty = float(data["load_shed_penalty_per_kwh"])
+    if new_penalty < 0:
+        return jsonify({"error": "甩负荷惩罚系数不能为负数"}), 400
+
+    config.COST_ATTRIBUTION_CONFIG["load_shed_penalty_per_kwh"] = new_penalty
+
+    return jsonify({
+        "status": "ok",
+        "message": "甩负荷惩罚系数已更新，立即生效（仅影响新的归因记录）",
+        "config": {
+            "load_shed_penalty_per_kwh": new_penalty,
+        },
+    })
+
+
+@app.route("/api/cost-attribution/missed-opportunities/summary", methods=["GET"])
+def get_missed_opportunities_summary():
+    """
+    错过的套利机会统计（"本可节省"分析）
+    参数:
+      - start_time: 开始时间 (ISO格式，可选)
+      - end_time: 结束时间 (ISO格式，可选)
+    """
+    try:
+        start_time_str = request.args.get("start_time")
+        end_time_str = request.args.get("end_time")
+
+        start_time = datetime.fromisoformat(start_time_str) if start_time_str else None
+        end_time = datetime.fromisoformat(end_time_str) if end_time_str else None
+
+        summary = state.compute_cost_attribution_summary(start_time, end_time)
+
+        filtered_opps = []
+        for opp in state.missed_opportunities:
+            if start_time and opp.timestamp < start_time:
+                continue
+            if end_time and opp.timestamp > end_time:
+                continue
+            filtered_opps.append(opp)
+
+        total_high_soc = sum(o.high_soc_savings for o in filtered_opps)
+        total_valley_hour = sum(o.valley_hour_savings for o in filtered_opps)
+
+        arbitrage_stats = state.get_arbitrage_stats_report()
+        actual_savings = arbitrage_stats.get("net_profit", 0.0)
+        total_potential = actual_savings + summary.total_missed_savings
+
+        return jsonify({
+            "status": "ok",
+            "summary": {
+                "actual_arbitrage_savings": round(actual_savings, 4),
+                "missed_high_soc_savings": round(total_high_soc, 4),
+                "missed_valley_hour_savings": round(total_valley_hour, 4),
+                "total_missed_savings": round(summary.total_missed_savings, 4),
+                "total_potential_savings": round(total_potential, 4),
+                "capture_ratio": round(
+                    (actual_savings / total_potential * 100) if total_potential > 0 else 0.0,
+                    2
+                ),
+                "opportunity_count": len(filtered_opps),
+            },
+            "time_range": {
+                "start_time": start_time_str,
+                "end_time": end_time_str,
+            },
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
 @app.route("/api/source/report", methods=["POST"])
 def report_source():
     """

@@ -342,6 +342,45 @@ class AuditLog:
         return len(self.anomalies) > 0
 
 
+@dataclass
+class CostAttribution:
+    attribution_id: str
+    dispatch_id: str
+    timestamp: datetime
+    grid_purchase_cost: float
+    diesel_generation_cost: float
+    diesel_startup_cost: float
+    load_shed_penalty_cost: float
+    bess_loss_cost: float
+    feed_in_revenue: float
+    total_comprehensive_cost: float
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MissedOpportunity:
+    opportunity_id: str
+    dispatch_id: str
+    timestamp: datetime
+    high_soc_savings: float
+    valley_hour_savings: float
+    total_missed_savings: float
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CostAttributionSummary:
+    total_grid_purchase_cost: float
+    total_diesel_cost: float
+    total_load_shed_penalty: float
+    total_bess_loss_cost: float
+    total_feed_in_revenue: float
+    total_comprehensive_cost: float
+    total_missed_savings: float
+    dispatch_count: int
+    breakdown: Dict[str, float] = field(default_factory=dict)
+
+
 class MicrogridState:
     HEALTH_WINDOW_SIZE = 50
     HEALTH_WARNING_THRESHOLD = 60.0
@@ -395,6 +434,11 @@ class MicrogridState:
         self.audit_logs: List[AuditLog] = []
         self._audit_counter: int = 0
         self._dispatch_counter: int = 0
+
+        self.cost_attributions: List[CostAttribution] = []
+        self.missed_opportunities: List[MissedOpportunity] = []
+        self._cost_attribution_counter: int = 0
+        self._missed_opportunity_counter: int = 0
 
         self.load_group_reports: Dict[str, LoadGroupReport] = {}
         self.load_group_state: Dict[str, Dict[str, Any]] = {}
@@ -1341,6 +1385,171 @@ class MicrogridState:
         anomalies = [log for log in self.audit_logs if log.has_anomaly()]
         anomalies = list(reversed(anomalies))
         return anomalies[:limit]
+
+    def generate_cost_attribution_id(self) -> str:
+        self._cost_attribution_counter += 1
+        return f"COST-{self._cost_attribution_counter:08d}"
+
+    def generate_missed_opportunity_id(self) -> str:
+        self._missed_opportunity_counter += 1
+        return f"MISS-{self._missed_opportunity_counter:08d}"
+
+    def add_cost_attribution(self, attribution: CostAttribution):
+        self.cost_attributions.append(attribution)
+
+    def add_missed_opportunity(self, opportunity: MissedOpportunity):
+        self.missed_opportunities.append(opportunity)
+
+    def get_cost_attribution_by_dispatch_id(self, dispatch_id: str) -> Optional[CostAttribution]:
+        for attr in self.cost_attributions:
+            if attr.dispatch_id == dispatch_id:
+                return attr
+        return None
+
+    def get_missed_opportunity_by_dispatch_id(self, dispatch_id: str) -> Optional[MissedOpportunity]:
+        for opp in self.missed_opportunities:
+            if opp.dispatch_id == dispatch_id:
+                return opp
+        return None
+
+    def query_cost_attributions(self,
+                                start_time: Optional[datetime] = None,
+                                end_time: Optional[datetime] = None,
+                                limit: int = 100,
+                                offset: int = 0) -> List[CostAttribution]:
+        result = []
+        for attr in self.cost_attributions:
+            if start_time and attr.timestamp < start_time:
+                continue
+            if end_time and attr.timestamp > end_time:
+                continue
+            result.append(attr)
+
+        result = list(reversed(result))
+        total = len(result)
+        start_idx = offset
+        end_idx = min(offset + limit, total)
+        return result[start_idx:end_idx]
+
+    def get_top_n_expensive_dispatches(self, n: int = 10) -> List[CostAttribution]:
+        sorted_attrs = sorted(
+            self.cost_attributions,
+            key=lambda x: x.total_comprehensive_cost,
+            reverse=True
+        )
+        return sorted_attrs[:n]
+
+    def compute_cost_attribution_summary(self,
+                                         start_time: Optional[datetime] = None,
+                                         end_time: Optional[datetime] = None) -> CostAttributionSummary:
+        filtered_attrs = []
+        for attr in self.cost_attributions:
+            if start_time and attr.timestamp < start_time:
+                continue
+            if end_time and attr.timestamp > end_time:
+                continue
+            filtered_attrs.append(attr)
+
+        total_grid = sum(a.grid_purchase_cost for a in filtered_attrs)
+        total_diesel_gen = sum(a.diesel_generation_cost for a in filtered_attrs)
+        total_diesel_startup = sum(a.diesel_startup_cost for a in filtered_attrs)
+        total_diesel = total_diesel_gen + total_diesel_startup
+        total_shed = sum(a.load_shed_penalty_cost for a in filtered_attrs)
+        total_bess_loss = sum(a.bess_loss_cost for a in filtered_attrs)
+        total_feedin = sum(a.feed_in_revenue for a in filtered_attrs)
+        total_comprehensive = sum(a.total_comprehensive_cost for a in filtered_attrs)
+
+        filtered_opps = []
+        for opp in self.missed_opportunities:
+            if start_time and opp.timestamp < start_time:
+                continue
+            if end_time and opp.timestamp > end_time:
+                continue
+            filtered_opps.append(opp)
+        total_missed = sum(o.total_missed_savings for o in filtered_opps)
+
+        breakdown = {
+            "grid_purchase": total_grid,
+            "diesel_generation": total_diesel_gen,
+            "diesel_startup": total_diesel_startup,
+            "load_shed_penalty": total_shed,
+            "bess_loss": total_bess_loss,
+            "feed_in_revenue": total_feedin,
+        }
+
+        return CostAttributionSummary(
+            total_grid_purchase_cost=round(total_grid, 4),
+            total_diesel_cost=round(total_diesel, 4),
+            total_load_shed_penalty=round(total_shed, 4),
+            total_bess_loss_cost=round(total_bess_loss, 4),
+            total_feed_in_revenue=round(total_feedin, 4),
+            total_comprehensive_cost=round(total_comprehensive, 4),
+            total_missed_savings=round(total_missed, 4),
+            dispatch_count=len(filtered_attrs),
+            breakdown=breakdown,
+        )
+
+    def get_cost_trend(self,
+                       granularity: str = "hour",
+                       start_time: Optional[datetime] = None,
+                       end_time: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        if granularity not in ("hour", "day"):
+            raise ValueError("granularity must be 'hour' or 'day'")
+
+        filtered_attrs = []
+        for attr in self.cost_attributions:
+            if start_time and attr.timestamp < start_time:
+                continue
+            if end_time and attr.timestamp > end_time:
+                continue
+            filtered_attrs.append(attr)
+
+        buckets: Dict[str, Dict[str, float]] = {}
+
+        for attr in filtered_attrs:
+            if granularity == "hour":
+                key = attr.timestamp.strftime("%Y-%m-%d %H:00")
+            else:
+                key = attr.timestamp.strftime("%Y-%m-%d")
+
+            if key not in buckets:
+                buckets[key] = {
+                    "grid_purchase_cost": 0.0,
+                    "diesel_generation_cost": 0.0,
+                    "diesel_startup_cost": 0.0,
+                    "load_shed_penalty_cost": 0.0,
+                    "bess_loss_cost": 0.0,
+                    "feed_in_revenue": 0.0,
+                    "total_comprehensive_cost": 0.0,
+                    "count": 0,
+                }
+
+            buckets[key]["grid_purchase_cost"] += attr.grid_purchase_cost
+            buckets[key]["diesel_generation_cost"] += attr.diesel_generation_cost
+            buckets[key]["diesel_startup_cost"] += attr.diesel_startup_cost
+            buckets[key]["load_shed_penalty_cost"] += attr.load_shed_penalty_cost
+            buckets[key]["bess_loss_cost"] += attr.bess_loss_cost
+            buckets[key]["feed_in_revenue"] += attr.feed_in_revenue
+            buckets[key]["total_comprehensive_cost"] += attr.total_comprehensive_cost
+            buckets[key]["count"] += 1
+
+        result = []
+        for key in sorted(buckets.keys()):
+            data = buckets[key]
+            entry = {
+                "time_key": key,
+                "grid_purchase_cost": round(data["grid_purchase_cost"], 4),
+                "diesel_generation_cost": round(data["diesel_generation_cost"], 4),
+                "diesel_startup_cost": round(data["diesel_startup_cost"], 4),
+                "load_shed_penalty_cost": round(data["load_shed_penalty_cost"], 4),
+                "bess_loss_cost": round(data["bess_loss_cost"], 4),
+                "feed_in_revenue": round(data["feed_in_revenue"], 4),
+                "total_comprehensive_cost": round(data["total_comprehensive_cost"], 4),
+                "dispatch_count": data["count"],
+            }
+            result.append(entry)
+
+        return result
 
     def compute_priority_load_shedding(self, gap_kw: float, now: datetime,
                                        dispatch_id: str = None) -> Tuple[Dict[str, float], float]:

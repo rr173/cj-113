@@ -140,6 +140,12 @@ def get_flat_price() -> float:
     return GRID_TARIFF["flat"]["price"]
 
 
+COST_ATTRIBUTION_CONFIG = {
+    "load_shed_penalty_per_kwh": 3.0,
+    "missed_opportunity_soc_target": 0.90,
+}
+
+
 DYNAMIC_SHED_CONFIG = {
     "enable_dynamic_shed": True,
     "pressure_history_size": 50,

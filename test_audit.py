@@ -733,5 +733,432 @@ class TestAPIFunctions:
         assert "cost_breakdown" in result["output_summary"]
 
 
+class TestCostAttributionModels:
+    """测试成本归因数据模型"""
+
+    def test_cost_attribution_creation(self):
+        from models import CostAttribution
+        now = datetime.now()
+        attr = CostAttribution(
+            attribution_id="COST-00000001",
+            dispatch_id="DISP-00000001",
+            timestamp=now,
+            grid_purchase_cost=10.5,
+            diesel_generation_cost=5.0,
+            diesel_startup_cost=50.0,
+            load_shed_penalty_cost=15.0,
+            bess_loss_cost=0.8,
+            feed_in_revenue=2.0,
+            total_comprehensive_cost=79.3,
+        )
+        assert attr.attribution_id == "COST-00000001"
+        assert attr.grid_purchase_cost == 10.5
+        assert attr.total_comprehensive_cost == 79.3
+
+    def test_missed_opportunity_creation(self):
+        from models import MissedOpportunity
+        now = datetime.now()
+        opp = MissedOpportunity(
+            opportunity_id="MISS-00000001",
+            dispatch_id="DISP-00000001",
+            timestamp=now,
+            high_soc_savings=8.5,
+            valley_hour_savings=12.0,
+            total_missed_savings=20.5,
+        )
+        assert opp.opportunity_id == "MISS-00000001"
+        assert opp.total_missed_savings == 20.5
+        assert opp.high_soc_savings + opp.valley_hour_savings == opp.total_missed_savings
+
+    def test_cost_attribution_summary_creation(self):
+        from models import CostAttributionSummary
+        summary = CostAttributionSummary(
+            total_grid_purchase_cost=100.0,
+            total_diesel_cost=80.0,
+            total_load_shed_penalty=30.0,
+            total_bess_loss_cost=5.0,
+            total_feed_in_revenue=15.0,
+            total_comprehensive_cost=200.0,
+            total_missed_savings=50.0,
+            dispatch_count=10,
+        )
+        assert summary.dispatch_count == 10
+        assert summary.total_comprehensive_cost == 200.0
+
+
+class TestCostAttributionAnalyzer:
+    """测试成本归因分析器"""
+
+    def test_grid_purchase_cost_calculation(self, populated_state, engine):
+        from audit import CostAttributionAnalyzer
+        now = datetime.now()
+        decision = engine.execute(now)
+
+        analyzer = CostAttributionAnalyzer(
+            state=populated_state,
+            decision=decision,
+            dispatch_id=decision.dispatch_id if hasattr(decision, 'dispatch_id') else "DISP-TEST",
+            now=now,
+            time_interval_hours=1.0 / 60.0,
+            diesel_startup_occurred=False,
+        )
+        attr = analyzer.compute_attribution()
+
+        assert attr.grid_purchase_cost >= 0
+        assert attr.total_comprehensive_cost >= 0
+
+    def test_cost_components_sum_to_total(self, populated_state, engine):
+        from audit import CostAttributionAnalyzer
+        now = datetime.now()
+        decision = engine.execute(now)
+
+        analyzer = CostAttributionAnalyzer(
+            state=populated_state,
+            decision=decision,
+            dispatch_id="DISP-TEST",
+            now=now,
+            time_interval_hours=1.0 / 60.0,
+            diesel_startup_occurred=False,
+        )
+        attr = analyzer.compute_attribution()
+
+        computed_total = (attr.grid_purchase_cost + attr.diesel_generation_cost +
+                          attr.diesel_startup_cost + attr.load_shed_penalty_cost +
+                          attr.bess_loss_cost - attr.feed_in_revenue)
+        assert abs(computed_total - attr.total_comprehensive_cost) < 0.001
+
+    def test_load_shed_penalty_uses_config(self, state):
+        from models import DispatchDecision
+        from audit import CostAttributionAnalyzer
+
+        config.COST_ATTRIBUTION_CONFIG["load_shed_penalty_per_kwh"] = 5.0
+
+        decision = DispatchDecision(
+            timestamp=datetime.now(),
+            pv_output={},
+            wt_output={},
+            diesel_output={},
+            bess_action={},
+            grid_import_kw=0.0,
+            grid_export_kw=0.0,
+            load_served_kw=0.0,
+            load_shed_kw=100.0,
+            cost=0.0,
+            tariff_period="flat",
+            grid_buy_price=0.8,
+        )
+
+        analyzer = CostAttributionAnalyzer(
+            state=state,
+            decision=decision,
+            dispatch_id="DISP-TEST",
+            now=datetime.now(),
+            time_interval_hours=1.0,
+            diesel_startup_occurred=False,
+        )
+        attr = analyzer.compute_attribution()
+
+        expected_penalty = 100.0 * 1.0 * 5.0
+        assert abs(attr.load_shed_penalty_cost - expected_penalty) < 0.01
+
+        config.COST_ATTRIBUTION_CONFIG["load_shed_penalty_per_kwh"] = 3.0
+
+    def test_diesel_startup_cost_flag(self, state):
+        from models import DispatchDecision
+        from audit import CostAttributionAnalyzer
+
+        decision = DispatchDecision(
+            timestamp=datetime.now(),
+            pv_output={},
+            wt_output={},
+            diesel_output={"ds1": 100.0},
+            bess_action={},
+            grid_import_kw=0.0,
+            grid_export_kw=0.0,
+            load_served_kw=100.0,
+            load_shed_kw=0.0,
+            cost=0.0,
+            tariff_period="flat",
+            grid_buy_price=0.8,
+        )
+
+        analyzer_no_startup = CostAttributionAnalyzer(
+            state=state,
+            decision=decision,
+            dispatch_id="DISP-TEST1",
+            now=datetime.now(),
+            time_interval_hours=1.0,
+            diesel_startup_occurred=False,
+        )
+        attr_no_startup = analyzer_no_startup.compute_attribution()
+        assert attr_no_startup.diesel_startup_cost == 0.0
+
+        analyzer_with_startup = CostAttributionAnalyzer(
+            state=state,
+            decision=decision,
+            dispatch_id="DISP-TEST2",
+            now=datetime.now(),
+            time_interval_hours=1.0,
+            diesel_startup_occurred=True,
+        )
+        attr_with_startup = analyzer_with_startup.compute_attribution()
+        assert attr_with_startup.diesel_startup_cost == config.DIESEL_CONFIG["ds1"]["startup_cost"]
+
+
+class TestMissedOpportunityCalculator:
+    """测试错过的套利机会计算"""
+
+    def test_high_soc_savings_when_soc_low(self, state):
+        from models import DispatchDecision
+        from audit import CostAttributionAnalyzer
+
+        decision = DispatchDecision(
+            timestamp=datetime.now(),
+            pv_output={},
+            wt_output={},
+            diesel_output={},
+            bess_action={"bes1": {"charge_kw": 0.0, "discharge_kw": 0.0, "soc_before": 0.3}},
+            grid_import_kw=50.0,
+            grid_export_kw=0.0,
+            load_served_kw=50.0,
+            load_shed_kw=0.0,
+            cost=40.0,
+            tariff_period="peak",
+            grid_buy_price=1.2,
+        )
+
+        analyzer = CostAttributionAnalyzer(
+            state=state,
+            decision=decision,
+            dispatch_id="DISP-TEST",
+            now=datetime.now(),
+            time_interval_hours=1.0,
+            diesel_startup_occurred=False,
+        )
+        opp = analyzer.compute_missed_opportunity()
+
+        assert opp.high_soc_savings > 0
+        assert opp.total_missed_savings >= opp.high_soc_savings
+
+    def test_valley_hour_savings_in_peak_period(self, state):
+        from models import DispatchDecision
+        from audit import CostAttributionAnalyzer
+
+        decision = DispatchDecision(
+            timestamp=datetime.now(),
+            pv_output={},
+            wt_output={},
+            diesel_output={},
+            bess_action={"bes1": {"charge_kw": 0.0, "discharge_kw": 0.0, "soc_before": 0.5}},
+            grid_import_kw=100.0,
+            grid_export_kw=0.0,
+            load_served_kw=100.0,
+            load_shed_kw=0.0,
+            cost=120.0,
+            tariff_period="peak",
+            grid_buy_price=1.2,
+        )
+
+        analyzer = CostAttributionAnalyzer(
+            state=state,
+            decision=decision,
+            dispatch_id="DISP-TEST",
+            now=datetime.now(),
+            time_interval_hours=1.0,
+            diesel_startup_occurred=False,
+        )
+        opp = analyzer.compute_missed_opportunity()
+
+        assert opp.valley_hour_savings > 0
+        valley_price = config.get_valley_price()
+        expected_savings = 100.0 * 1.0 * (1.2 - valley_price)
+        assert abs(opp.valley_hour_savings - expected_savings) < 0.01
+
+    def test_no_valley_savings_when_valley_period(self, state):
+        from models import DispatchDecision
+        from audit import CostAttributionAnalyzer
+
+        decision = DispatchDecision(
+            timestamp=datetime.now(),
+            pv_output={},
+            wt_output={},
+            diesel_output={},
+            bess_action={"bes1": {"charge_kw": 0.0, "discharge_kw": 0.0, "soc_before": 0.5}},
+            grid_import_kw=100.0,
+            grid_export_kw=0.0,
+            load_served_kw=100.0,
+            load_shed_kw=0.0,
+            cost=40.0,
+            tariff_period="valley",
+            grid_buy_price=0.4,
+        )
+
+        analyzer = CostAttributionAnalyzer(
+            state=state,
+            decision=decision,
+            dispatch_id="DISP-TEST",
+            now=datetime.now(),
+            time_interval_hours=1.0,
+            diesel_startup_occurred=False,
+        )
+        opp = analyzer.compute_missed_opportunity()
+
+        assert opp.valley_hour_savings == 0.0
+
+
+class TestMicrogridStateCostAttribution:
+    """测试MicrogridState的成本归因方法"""
+
+    def test_generate_ids(self, state):
+        attr_id1 = state.generate_cost_attribution_id()
+        attr_id2 = state.generate_cost_attribution_id()
+        assert attr_id1 == "COST-00000001"
+        assert attr_id2 == "COST-00000002"
+
+        opp_id1 = state.generate_missed_opportunity_id()
+        opp_id2 = state.generate_missed_opportunity_id()
+        assert opp_id1 == "MISS-00000001"
+        assert opp_id2 == "MISS-00000002"
+
+    def test_add_and_get_cost_attribution(self, state):
+        from models import CostAttribution
+        now = datetime.now()
+        attr = CostAttribution(
+            attribution_id="COST-00000001",
+            dispatch_id="DISP-00000001",
+            timestamp=now,
+            grid_purchase_cost=10.0,
+            diesel_generation_cost=5.0,
+            diesel_startup_cost=0.0,
+            load_shed_penalty_cost=0.0,
+            bess_loss_cost=0.5,
+            feed_in_revenue=0.0,
+            total_comprehensive_cost=15.5,
+        )
+        state.add_cost_attribution(attr)
+        assert len(state.cost_attributions) == 1
+
+        retrieved = state.get_cost_attribution_by_dispatch_id("DISP-00000001")
+        assert retrieved is not None
+        assert retrieved.grid_purchase_cost == 10.0
+
+        not_found = state.get_cost_attribution_by_dispatch_id("DISP-99999999")
+        assert not_found is None
+
+    def test_compute_cost_attribution_summary(self, state):
+        from models import CostAttribution, MissedOpportunity
+        now = datetime.now()
+
+        for i in range(5):
+            attr = CostAttribution(
+                attribution_id=f"COST-{i+1:08d}",
+                dispatch_id=f"DISP-{i+1:08d}",
+                timestamp=now - timedelta(minutes=i * 5),
+                grid_purchase_cost=10.0 * (i + 1),
+                diesel_generation_cost=5.0 * (i + 1),
+                diesel_startup_cost=0.0,
+                load_shed_penalty_cost=2.0 * (i + 1),
+                bess_loss_cost=0.5 * (i + 1),
+                feed_in_revenue=1.0 * (i + 1),
+                total_comprehensive_cost=16.5 * (i + 1),
+            )
+            state.add_cost_attribution(attr)
+
+            opp = MissedOpportunity(
+                opportunity_id=f"MISS-{i+1:08d}",
+                dispatch_id=f"DISP-{i+1:08d}",
+                timestamp=now - timedelta(minutes=i * 5),
+                high_soc_savings=3.0 * (i + 1),
+                valley_hour_savings=2.0 * (i + 1),
+                total_missed_savings=5.0 * (i + 1),
+            )
+            state.add_missed_opportunity(opp)
+
+        summary = state.compute_cost_attribution_summary()
+        assert summary.dispatch_count == 5
+        assert summary.total_grid_purchase_cost == 150.0
+        assert summary.total_missed_savings == 75.0
+
+    def test_get_top_n_expensive_dispatches(self, state):
+        from models import CostAttribution
+        now = datetime.now()
+
+        costs = [10.0, 50.0, 30.0, 80.0, 20.0]
+        for i, cost in enumerate(costs):
+            attr = CostAttribution(
+                attribution_id=f"COST-{i+1:08d}",
+                dispatch_id=f"DISP-{i+1:08d}",
+                timestamp=now - timedelta(minutes=i),
+                grid_purchase_cost=cost,
+                diesel_generation_cost=0.0,
+                diesel_startup_cost=0.0,
+                load_shed_penalty_cost=0.0,
+                bess_loss_cost=0.0,
+                feed_in_revenue=0.0,
+                total_comprehensive_cost=cost,
+            )
+            state.add_cost_attribution(attr)
+
+        top3 = state.get_top_n_expensive_dispatches(3)
+        assert len(top3) == 3
+        assert top3[0].total_comprehensive_cost == 80.0
+        assert top3[1].total_comprehensive_cost == 50.0
+        assert top3[2].total_comprehensive_cost == 30.0
+
+    def test_get_cost_trend_hourly(self, state):
+        from models import CostAttribution
+        base_time = datetime(2024, 1, 15, 10, 0, 0)
+
+        for i in range(10):
+            hour_offset = i // 3
+            attr = CostAttribution(
+                attribution_id=f"COST-{i+1:08d}",
+                dispatch_id=f"DISP-{i+1:08d}",
+                timestamp=base_time + timedelta(hours=hour_offset, minutes=i * 20),
+                grid_purchase_cost=10.0,
+                diesel_generation_cost=5.0,
+                diesel_startup_cost=0.0,
+                load_shed_penalty_cost=0.0,
+                bess_loss_cost=1.0,
+                feed_in_revenue=2.0,
+                total_comprehensive_cost=14.0,
+            )
+            state.add_cost_attribution(attr)
+
+        trend = state.get_cost_trend(granularity="hour")
+        assert len(trend) >= 3
+        for entry in trend:
+            assert "time_key" in entry
+            assert "total_comprehensive_cost" in entry
+            assert "grid_purchase_cost" in entry
+
+
+class TestDispatcherCostAttributionIntegration:
+    """测试调度器与成本归因的集成"""
+
+    def test_dispatch_generates_cost_attribution(self, populated_state, engine):
+        now = datetime.now()
+        decision = engine.execute(now)
+
+        assert len(populated_state.cost_attributions) == 1
+        assert len(populated_state.missed_opportunities) == 1
+
+        attr = populated_state.cost_attributions[0]
+        assert attr.attribution_id.startswith("COST-")
+        assert attr.dispatch_id.startswith("DISP-")
+        assert attr.timestamp == now
+
+    def test_multiple_dispatches_accumulate_attributions(self, populated_state, engine):
+        now = datetime.now()
+        for i in range(5):
+            engine.execute(now + timedelta(minutes=i))
+
+        assert len(populated_state.cost_attributions) == 5
+        assert len(populated_state.missed_opportunities) == 5
+
+        summary = populated_state.compute_cost_attribution_summary()
+        assert summary.dispatch_count == 5
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
