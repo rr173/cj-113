@@ -1,3 +1,4 @@
+from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field, asdict
@@ -475,6 +476,10 @@ class MicrogridState:
         self.emergency_shed_extra_kw: Dict[str, float] = {}
         self.emergency_shed_extra_initial: Dict[str, float] = {}
         self.pending_restore_from_emergency: bool = False
+
+        self.daily_reports: Dict[str, DailyReport] = {}
+        self.weekly_reports: Dict[str, WeeklyReport] = {}
+        self._report_generator = None
 
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
@@ -2282,3 +2287,161 @@ class MicrogridState:
             "extra_shed_by_group": {gid: round(kw, 2) for gid, kw in self.emergency_shed_extra_kw.items()},
             "restore_rate_per_cycle": config.DYNAMIC_SHED_CONFIG["restore_rate_per_cycle"],
         }
+
+    def _get_report_generator(self):
+        if self._report_generator is None:
+            from report import ReportGenerator
+            self._report_generator = ReportGenerator(self)
+        return self._report_generator
+
+    def generate_daily_report(self, date_str: str = None) -> DailyReport:
+        generator = self._get_report_generator()
+        report = generator.generate_daily_report(date_str)
+        self.daily_reports[report.report_date] = report
+        return report
+
+    def generate_weekly_report(self, start_date_str: str, end_date_str: str) -> WeeklyReport:
+        generator = self._get_report_generator()
+        report = generator.generate_weekly_report(start_date_str, end_date_str)
+        key = f"{start_date_str}_{end_date_str}"
+        self.weekly_reports[key] = report
+        return report
+
+    def get_daily_report(self, date_str: str) -> Optional[DailyReport]:
+        return self.daily_reports.get(date_str)
+
+    def get_weekly_report(self, start_date_str: str, end_date_str: str) -> Optional[WeeklyReport]:
+        key = f"{start_date_str}_{end_date_str}"
+        return self.weekly_reports.get(key)
+
+    def get_report_by_id(self, report_id: str):
+        for report in self.daily_reports.values():
+            if report.report_id == report_id:
+                return report
+        for report in self.weekly_reports.values():
+            if report.report_id == report_id:
+                return report
+        return None
+
+    def list_reports(self, report_type: str = None) -> List[Any]:
+        result = []
+        if report_type is None or report_type == "daily":
+            for report in self.daily_reports.values():
+                result.append(report)
+        if report_type is None or report_type == "weekly":
+            for report in self.weekly_reports.values():
+                result.append(report)
+        result.sort(key=lambda r: r.generated_at, reverse=True)
+        return result
+
+    def delete_report(self, report_id: str) -> bool:
+        keys_to_delete = []
+        for key, report in self.daily_reports.items():
+            if report.report_id == report_id:
+                keys_to_delete.append(("daily", key))
+        for key, report in self.weekly_reports.items():
+            if report.report_id == report_id:
+                keys_to_delete.append(("weekly", key))
+        
+        if not keys_to_delete:
+            return False
+        
+        for rtype, key in keys_to_delete:
+            if rtype == "daily":
+                del self.daily_reports[key]
+            else:
+                del self.weekly_reports[key]
+        return True
+
+
+@dataclass
+class TopExpensiveDispatch:
+    dispatch_id: str
+    timestamp: datetime
+    total_cost: float
+    cost_breakdown: Dict[str, float]
+    reason: str
+
+
+@dataclass
+class BatteryDailyStats:
+    total_charged_kwh: float
+    total_discharged_kwh: float
+    soc_min: float
+    soc_max: float
+    cycle_increment: float
+    start_soc: float
+    end_soc: float
+
+
+@dataclass
+class LoadGroupReliability:
+    group_id: str
+    group_name: str
+    reliability_percent: float
+    total_snapshots: int
+    shed_snapshots: int
+
+
+@dataclass
+class StrategySuggestion:
+    type: str
+    severity: str
+    title: str
+    description: str
+    data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DailyReport:
+    report_id: str
+    report_type: str
+    report_date: str
+    generated_at: datetime
+    dispatch_count: int
+    grid_purchase_cost: float
+    diesel_total_cost: float
+    diesel_generation_cost: float
+    diesel_startup_cost: float
+    load_shed_penalty: float
+    feed_in_revenue: float
+    net_cost: float
+    prev_day_net_cost: Optional[float]
+    net_cost_change_percent: Optional[float]
+    top_expensive_dispatches: List[TopExpensiveDispatch]
+    battery_stats: Dict[str, BatteryDailyStats]
+    load_group_reliability: List[LoadGroupReliability]
+    valley_purchase_ratio: float
+    total_grid_import_kwh: float
+    valley_grid_import_kwh: float
+    suggestions: List[StrategySuggestion]
+    total_load_shed_events: int
+    total_load_shed_duration_minutes: float
+    renewable_surplus_kwh: float
+
+
+@dataclass
+class WeeklyReport:
+    report_id: str
+    report_type: str
+    start_date: str
+    end_date: str
+    generated_at: datetime
+    total_dispatch_count: int
+    avg_daily_dispatch_count: float
+    total_grid_purchase_cost: float
+    avg_daily_grid_purchase_cost: float
+    total_diesel_cost: float
+    total_load_shed_penalty: float
+    total_feed_in_revenue: float
+    total_net_cost: float
+    avg_daily_net_cost: float
+    most_expensive_day: str
+    most_expensive_day_cost: float
+    cheapest_day: str
+    cheapest_day_cost: float
+    daily_trend: List[Dict[str, Any]]
+    storage_arbitrage_profit: float
+    total_load_shed_events: int
+    total_load_shed_duration_minutes: float
+    suggestions: List[StrategySuggestion]

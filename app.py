@@ -1601,6 +1601,249 @@ def get_all_config():
     })
 
 
+def _daily_report_to_dict(report):
+    return {
+        "report_id": report.report_id,
+        "report_type": report.report_type,
+        "report_date": report.report_date,
+        "generated_at": report.generated_at.isoformat(),
+        "dispatch_count": report.dispatch_count,
+        "grid_purchase_cost": round(report.grid_purchase_cost, 4),
+        "diesel_total_cost": round(report.diesel_total_cost, 4),
+        "diesel_generation_cost": round(report.diesel_generation_cost, 4),
+        "diesel_startup_cost": round(report.diesel_startup_cost, 4),
+        "load_shed_penalty": round(report.load_shed_penalty, 4),
+        "feed_in_revenue": round(report.feed_in_revenue, 4),
+        "net_cost": round(report.net_cost, 4),
+        "prev_day_net_cost": round(report.prev_day_net_cost, 4) if report.prev_day_net_cost is not None else None,
+        "net_cost_change_percent": report.net_cost_change_percent,
+        "net_cost_change_direction": "上升" if report.net_cost_change_percent and report.net_cost_change_percent > 0 else "下降" if report.net_cost_change_percent and report.net_cost_change_percent < 0 else "持平",
+        "top_expensive_dispatches": [
+            {
+                "dispatch_id": d.dispatch_id,
+                "timestamp": d.timestamp.isoformat(),
+                "total_cost": round(d.total_cost, 4),
+                "cost_breakdown": d.cost_breakdown,
+                "reason": d.reason,
+            }
+            for d in report.top_expensive_dispatches
+        ],
+        "battery_stats": {
+            bes_id: {
+                "total_charged_kwh": round(bs.total_charged_kwh, 4),
+                "total_discharged_kwh": round(bs.total_discharged_kwh, 4),
+                "soc_min_percent": round(bs.soc_min * 100, 2),
+                "soc_max_percent": round(bs.soc_max * 100, 2),
+                "cycle_increment": round(bs.cycle_increment, 4),
+                "start_soc_percent": round(bs.start_soc * 100, 2),
+                "end_soc_percent": round(bs.end_soc * 100, 2),
+            }
+            for bes_id, bs in report.battery_stats.items()
+        },
+        "load_group_reliability": [
+            {
+                "group_id": r.group_id,
+                "group_name": r.group_name,
+                "reliability_percent": round(r.reliability_percent, 2),
+                "total_snapshots": r.total_snapshots,
+                "shed_snapshots": r.shed_snapshots,
+            }
+            for r in report.load_group_reliability
+        ],
+        "valley_purchase_ratio": round(report.valley_purchase_ratio, 4),
+        "valley_purchase_ratio_percent": round(report.valley_purchase_ratio * 100, 2),
+        "total_grid_import_kwh": round(report.total_grid_import_kwh, 4),
+        "valley_grid_import_kwh": round(report.valley_grid_import_kwh, 4),
+        "total_load_shed_events": report.total_load_shed_events,
+        "total_load_shed_duration_minutes": round(report.total_load_shed_duration_minutes, 2),
+        "renewable_surplus_kwh": round(report.renewable_surplus_kwh, 4),
+        "suggestions": [
+            {
+                "type": s.type,
+                "severity": s.severity,
+                "title": s.title,
+                "description": s.description,
+                "data": s.data,
+            }
+            for s in report.suggestions
+        ],
+        "suggestion_count": len(report.suggestions),
+    }
+
+
+def _weekly_report_to_dict(report):
+    return {
+        "report_id": report.report_id,
+        "report_type": report.report_type,
+        "start_date": report.start_date,
+        "end_date": report.end_date,
+        "generated_at": report.generated_at.isoformat(),
+        "total_dispatch_count": report.total_dispatch_count,
+        "avg_daily_dispatch_count": round(report.avg_daily_dispatch_count, 2),
+        "total_grid_purchase_cost": round(report.total_grid_purchase_cost, 4),
+        "avg_daily_grid_purchase_cost": round(report.avg_daily_grid_purchase_cost, 4),
+        "total_diesel_cost": round(report.total_diesel_cost, 4),
+        "total_load_shed_penalty": round(report.total_load_shed_penalty, 4),
+        "total_feed_in_revenue": round(report.total_feed_in_revenue, 4),
+        "total_net_cost": round(report.total_net_cost, 4),
+        "avg_daily_net_cost": round(report.avg_daily_net_cost, 4),
+        "most_expensive_day": report.most_expensive_day,
+        "most_expensive_day_cost": round(report.most_expensive_day_cost, 4),
+        "cheapest_day": report.cheapest_day,
+        "cheapest_day_cost": round(report.cheapest_day_cost, 4),
+        "daily_trend": report.daily_trend,
+        "storage_arbitrage_profit": round(report.storage_arbitrage_profit, 4),
+        "total_load_shed_events": report.total_load_shed_events,
+        "total_load_shed_duration_minutes": round(report.total_load_shed_duration_minutes, 2),
+        "suggestions": [
+            {
+                "type": s.type,
+                "severity": s.severity,
+                "title": s.title,
+                "description": s.description,
+                "data": s.data,
+            }
+            for s in report.suggestions
+        ],
+        "suggestion_count": len(report.suggestions),
+    }
+
+
+def _report_brief_to_dict(report):
+    if report.report_type == "daily":
+        return {
+            "report_id": report.report_id,
+            "report_type": report.report_type,
+            "report_date": report.report_date,
+            "generated_at": report.generated_at.isoformat(),
+            "dispatch_count": report.dispatch_count,
+            "net_cost": round(report.net_cost, 4),
+            "suggestion_count": len(report.suggestions),
+        }
+    else:
+        return {
+            "report_id": report.report_id,
+            "report_type": report.report_type,
+            "start_date": report.start_date,
+            "end_date": report.end_date,
+            "generated_at": report.generated_at.isoformat(),
+            "total_dispatch_count": report.total_dispatch_count,
+            "total_net_cost": round(report.total_net_cost, 4),
+            "suggestion_count": len(report.suggestions),
+        }
+
+
+@app.route("/api/report/daily", methods=["POST"])
+def generate_daily_report():
+    """
+    生成日报
+    请求体: {
+        "date": "2024-06-18"    (可选，默认当天)
+    }
+    同一天重复生成会覆盖旧的报告
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        date_str = data.get("date")
+        
+        report = state.generate_daily_report(date_str)
+        
+        return jsonify({
+            "status": "ok",
+            "message": "日报生成成功",
+            "report": _daily_report_to_dict(report),
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/report/weekly", methods=["POST"])
+def generate_weekly_report():
+    """
+    生成周报
+    请求体: {
+        "start_date": "2024-06-10",
+        "end_date": "2024-06-16"
+    }
+    相同起止日期重复生成会覆盖旧的报告
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        start_date = data.get("start_date")
+        end_date = data.get("end_date")
+        
+        if not start_date or not end_date:
+            return jsonify({"error": "缺少必填字段: start_date 和 end_date"}), 400
+        
+        report = state.generate_weekly_report(start_date, end_date)
+        
+        return jsonify({
+            "status": "ok",
+            "message": "周报生成成功",
+            "report": _weekly_report_to_dict(report),
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/report/list", methods=["GET"])
+def list_reports():
+    """
+    列出所有报告
+    参数:
+      - type: 可选，daily/weekly，按类型筛选
+    """
+    report_type = request.args.get("type")
+    if report_type and report_type not in ("daily", "weekly"):
+        return jsonify({"error": "type 必须是 daily 或 weekly"}), 400
+    
+    reports = state.list_reports(report_type)
+    
+    return jsonify({
+        "status": "ok",
+        "total": len(reports),
+        "type_filter": report_type,
+        "reports": [_report_brief_to_dict(r) for r in reports],
+    })
+
+
+@app.route("/api/report/<report_id>", methods=["GET"])
+def get_report_detail(report_id):
+    """
+    查看单份报告详情
+    """
+    report = state.get_report_by_id(report_id)
+    if report is None:
+        return jsonify({"error": f"未找到报告: {report_id}"}), 404
+    
+    if report.report_type == "daily":
+        return jsonify({
+            "status": "ok",
+            "report": _daily_report_to_dict(report),
+        })
+    else:
+        return jsonify({
+            "status": "ok",
+            "report": _weekly_report_to_dict(report),
+        })
+
+
+@app.route("/api/report/<report_id>", methods=["DELETE"])
+def delete_report(report_id):
+    """
+    删除报告
+    """
+    success = state.delete_report(report_id)
+    if not success:
+        return jsonify({"error": f"未找到报告: {report_id}"}), 404
+    
+    return jsonify({
+        "status": "ok",
+        "message": "报告已删除",
+        "report_id": report_id,
+    })
+
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({
@@ -1620,6 +1863,8 @@ def health_check():
             "total_shed_events": len(state.load_group_shed_events),
             "all_groups_reported": state.all_groups_reported(),
         },
+        "daily_report_count": len(state.daily_reports),
+        "weekly_report_count": len(state.weekly_reports),
     })
 
 
@@ -1673,6 +1918,11 @@ def _list_endpoints():
         "GET /api/audit/logs/<audit_id> - 单条审计日志详情",
         "GET /api/audit/anomalies - 异常决策列表",
         "GET /api/audit/compare - 决策对比接口",
+        "POST /api/report/daily - 生成日报",
+        "POST /api/report/weekly - 生成周报",
+        "GET /api/report/list - 报告列表（支持按类型筛选）",
+        "GET /api/report/<report_id> - 单份报告详情",
+        "DELETE /api/report/<report_id> - 删除报告",
         "GET /api/health - 健康检查",
     ]
 
