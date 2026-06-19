@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from alert_manager import (
     AlertManager, INFO, WARNING, CRITICAL,
     NOTIFICATION_STATUS_SENT, NOTIFICATION_STATUS_UNATTENDED,
+    NOTIFICATION_STATUS_CANCELLED,
 )
 
 
@@ -285,6 +286,98 @@ class TestNotificationRetry:
         assert notifications[0].sent_to == "白班"
 
 
+class TestAcknowledgementCancelsNotifications:
+    def test_acknowledge_alert_cancels_unattended_notification(self, am):
+        am.add_duty_staff("白班", "111", 8, 20)
+        base_time = datetime(2024, 6, 20, 2, 0, 0)
+        for i in range(3):
+            alert = am.report_alert("LOAD_SHEDDING", "甩负荷", now=base_time + timedelta(minutes=i))
+        am.check_time_based_escalation(now=base_time + timedelta(minutes=15))
+        notifications = am.get_notifications()
+        assert len(notifications) == 1
+        assert notifications[0].status == NOTIFICATION_STATUS_UNATTENDED
+
+        am.acknowledge_alert(alert.alert_id, acknowledged_by="操作员", now=base_time + timedelta(minutes=30))
+
+        notifications = am.get_notifications()
+        assert notifications[0].status == NOTIFICATION_STATUS_CANCELLED
+        assert notifications[0].cancelled_by == "操作员"
+        assert "告警已被确认" in notifications[0].cancel_reason
+        assert notifications[0].retry_at is None
+        assert notifications[0].sent_to is None
+
+    def test_acknowledge_after_time_process_no_send(self, am):
+        am.add_duty_staff("白班", "111", 8, 20)
+        base_time = datetime(2024, 6, 20, 2, 0, 0)
+        for i in range(3):
+            alert = am.report_alert("LOAD_SHEDDING", "甩负荷", now=base_time + timedelta(minutes=i))
+        am.check_time_based_escalation(now=base_time + timedelta(minutes=15))
+
+        am.acknowledge_alert(alert.alert_id, acknowledged_by="操作员", now=base_time + timedelta(minutes=30))
+
+        retry_time = datetime(2024, 6, 20, 9, 0, 0)
+        am.process_pending_notifications(retry_time)
+
+        notifications = am.get_notifications()
+        assert len(notifications) == 1
+        assert notifications[0].status == NOTIFICATION_STATUS_CANCELLED
+        assert notifications[0].sent_to is None
+
+    def test_acknowledge_by_type_cancels_notifications(self, am):
+        am.add_duty_staff("白班", "111", 8, 20)
+        base_time = datetime(2024, 6, 20, 2, 0, 0)
+        for i in range(3):
+            am.report_alert("LOAD_SHEDDING", "甩负荷", now=base_time + timedelta(minutes=i))
+        am.check_time_based_escalation(now=base_time + timedelta(minutes=15))
+        notifications_before = am.get_notifications()
+        assert notifications_before[0].status == NOTIFICATION_STATUS_UNATTENDED
+
+        am.acknowledge_alerts_by_type("LOAD_SHEDDING", acknowledged_by="批量操作",
+                                       now=base_time + timedelta(minutes=30))
+
+        notifications_after = am.get_notifications()
+        assert notifications_after[0].status == NOTIFICATION_STATUS_CANCELLED
+        assert notifications_after[0].cancelled_by == "批量操作"
+
+    def test_process_pending_notifications_detects_acknowledged_alert(self, am):
+        am.add_duty_staff("白班", "111", 8, 20)
+        base_time = datetime(2024, 6, 20, 2, 0, 0)
+        for i in range(3):
+            alert = am.report_alert("LOAD_SHEDDING", "甩负荷", now=base_time + timedelta(minutes=i))
+        am.check_time_based_escalation(now=base_time + timedelta(minutes=15))
+        notifications_before = am.get_notifications()
+        assert notifications_before[0].status == NOTIFICATION_STATUS_UNATTENDED
+
+        alert.acknowledged = True
+        alert.acknowledged_at = base_time + timedelta(minutes=30)
+        alert.acknowledged_by = "手动直接改"
+
+        retry_time = datetime(2024, 6, 20, 9, 0, 0)
+        am.process_pending_notifications(retry_time)
+
+        notifications = am.get_notifications()
+        assert notifications[0].status == NOTIFICATION_STATUS_CANCELLED
+        assert "重试发送时发现" in notifications[0].cancel_reason
+        assert notifications[0].sent_to is None
+
+    def test_already_sent_notification_not_cancelled(self, am):
+        am.add_duty_staff("白班", "111", 0, 23)
+        base_time = datetime(2024, 6, 20, 10, 0, 0)
+        for i in range(3):
+            alert = am.report_alert("LOAD_SHEDDING", "甩负荷", now=base_time + timedelta(minutes=i))
+        am.check_time_based_escalation(now=base_time + timedelta(minutes=15))
+        notifications_before = am.get_notifications()
+        assert notifications_before[0].status == NOTIFICATION_STATUS_SENT
+        assert notifications_before[0].sent_to == "白班"
+
+        am.acknowledge_alert(alert.alert_id, acknowledged_by="操作员")
+
+        notifications_after = am.get_notifications()
+        assert notifications_after[0].status == NOTIFICATION_STATUS_SENT
+        assert notifications_after[0].sent_to == "白班"
+        assert notifications_after[0].cancelled_at is None
+
+
 class TestQueryInterfaces:
     def test_get_active_alerts_filter_by_level(self, am):
         am.report_alert("A", "a")
@@ -319,11 +412,10 @@ class TestQueryInterfaces:
         base_time = datetime(2024, 6, 20, 2, 0, 0)
         for i in range(3):
             am.report_alert("LOAD_SHEDDING", "甩负荷", now=base_time + timedelta(minutes=i))
-        first_alert = am.get_active_alerts()[0]
         am.check_time_based_escalation(now=base_time + timedelta(minutes=15))
-        am.acknowledge_alert(first_alert.alert_id, now=base_time + timedelta(minutes=16))
 
         base_time2 = datetime(2024, 6, 20, 10, 0, 0)
+        am.acknowledge_alerts_by_type("LOAD_SHEDDING", now=base_time2)
         for i in range(3):
             am.report_alert("LOAD_SHEDDING", "甩负荷B", now=base_time2 + timedelta(minutes=i))
         am.check_time_based_escalation(now=base_time2 + timedelta(minutes=15))
@@ -332,8 +424,8 @@ class TestQueryInterfaces:
         assert len(all_not) == 2
         sent = am.get_notifications(status=NOTIFICATION_STATUS_SENT)
         assert len(sent) == 1
-        unattended = am.get_notifications(status=NOTIFICATION_STATUS_UNATTENDED)
-        assert len(unattended) == 1
+        cancelled = am.get_notifications(status=NOTIFICATION_STATUS_CANCELLED)
+        assert len(cancelled) == 1
 
     def test_alert_statistics(self, am):
         base_time = datetime(2024, 6, 20, 10, 0, 0)

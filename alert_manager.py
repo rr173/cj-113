@@ -19,6 +19,7 @@ WARNING_ACK_TIMEOUT_MINUTES = 10
 NOTIFICATION_STATUS_PENDING = "pending"
 NOTIFICATION_STATUS_SENT = "sent"
 NOTIFICATION_STATUS_UNATTENDED = "unattended"
+NOTIFICATION_STATUS_CANCELLED = "cancelled"
 
 
 @dataclass
@@ -103,12 +104,16 @@ class Notification:
     sent_at: Optional[datetime] = None
     sent_to: Optional[str] = None
     retry_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
+    cancelled_by: Optional[str] = None
+    cancel_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         status_text = {
             NOTIFICATION_STATUS_PENDING: "待发送",
             NOTIFICATION_STATUS_SENT: "已发送",
             NOTIFICATION_STATUS_UNATTENDED: "无人接收",
+            NOTIFICATION_STATUS_CANCELLED: "已取消",
         }
         return {
             "notification_id": self.notification_id,
@@ -122,6 +127,9 @@ class Notification:
             "sent_at": self.sent_at.isoformat() if self.sent_at else None,
             "sent_to": self.sent_to,
             "retry_at": self.retry_at.isoformat() if self.retry_at else None,
+            "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None,
+            "cancelled_by": self.cancelled_by,
+            "cancel_reason": self.cancel_reason,
         }
 
 
@@ -294,6 +302,19 @@ class AlertManager:
         self._notifications.append(notification)
         self._dispatch_notification(notification, now)
 
+    def _cancel_pending_notifications_for_alert(self, alert_id: str, cancelled_by: str,
+                                                 now: datetime):
+        for n in self._notifications:
+            if n.alert_id != alert_id:
+                continue
+            if n.status in (NOTIFICATION_STATUS_SENT, NOTIFICATION_STATUS_CANCELLED):
+                continue
+            n.status = NOTIFICATION_STATUS_CANCELLED
+            n.cancelled_at = now
+            n.cancelled_by = cancelled_by or "系统"
+            n.cancel_reason = "关联告警已被确认处理，通知取消"
+            n.retry_at = None
+
     def acknowledge_alert(self, alert_id: str, acknowledged_by: str = None,
                           now: datetime = None) -> bool:
         if now is None:
@@ -307,6 +328,7 @@ class AlertManager:
         if alert.alert_type in self._active_alerts_by_type:
             if self._active_alerts_by_type[alert.alert_type].alert_id == alert_id:
                 del self._active_alerts_by_type[alert.alert_type]
+        self._cancel_pending_notifications_for_alert(alert_id, acknowledged_by, now)
         return True
 
     def acknowledge_alerts_by_type(self, alert_type: str, acknowledged_by: str = None,
@@ -319,6 +341,9 @@ class AlertManager:
                 alert.acknowledged = True
                 alert.acknowledged_at = now
                 alert.acknowledged_by = acknowledged_by
+                self._cancel_pending_notifications_for_alert(
+                    alert.alert_id, acknowledged_by, now
+                )
                 count += 1
         if alert_type in self._active_alerts_by_type:
             del self._active_alerts_by_type[alert_type]
@@ -458,6 +483,14 @@ class AlertManager:
         for n in self._notifications:
             if n.status == NOTIFICATION_STATUS_UNATTENDED and n.retry_at:
                 if now >= n.retry_at:
+                    alert = self._alerts.get(n.alert_id)
+                    if alert and alert.acknowledged:
+                        n.status = NOTIFICATION_STATUS_CANCELLED
+                        n.cancelled_at = now
+                        n.cancelled_by = "系统"
+                        n.cancel_reason = "重试发送时发现关联告警已被确认，通知取消"
+                        n.retry_at = None
+                        continue
                     on_duty = self.get_on_duty_staff(now)
                     if on_duty:
                         n.status = NOTIFICATION_STATUS_SENT

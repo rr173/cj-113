@@ -2076,7 +2076,7 @@ def get_on_duty_now():
 def get_notifications():
     """查询通知队列（已发送/待发送/无人接收）"""
     status = request.args.get("status")
-    valid_statuses = ("pending", "sent", "unattended")
+    valid_statuses = ("pending", "sent", "unattended", "cancelled")
     if status and status not in valid_statuses:
         return jsonify({"error": f"status 必须是 {valid_statuses} 之一"}), 400
     state.alert_manager.process_pending_notifications()
