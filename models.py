@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, asdict
 from copy import deepcopy
 
 import config
+from alert_manager import AlertManager
 
 
 @dataclass
@@ -481,6 +482,8 @@ class MicrogridState:
         self.weekly_reports: Dict[str, WeeklyReport] = {}
         self._report_generator = None
 
+        self.alert_manager = AlertManager()
+
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
             self.pv_reports[report.source_id] = report
@@ -653,11 +656,15 @@ class MicrogridState:
         self.last_dispatch_time = decision.timestamp
 
     def add_alert(self, alert_type: str, message: str, data: Dict[str, Any] = None):
+        now = datetime.now()
+        alert_obj = self.alert_manager.report_alert(alert_type, message, data or {}, now)
         self.alerts.append({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now.isoformat(),
             "type": alert_type,
             "message": message,
             "data": data or {},
+            "alert_id": alert_obj.alert_id,
+            "level": alert_obj.level,
         })
         if len(self.alerts) > 1000:
             self.alerts = self.alerts[-1000:]

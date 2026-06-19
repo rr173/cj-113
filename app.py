@@ -1844,6 +1844,271 @@ def delete_report(report_id):
     })
 
 
+@app.route("/api/alerts/active", methods=["GET"])
+def get_active_alerts():
+    """查询当前活跃告警列表（未确认），按级别筛选，按时间排序"""
+    level = request.args.get("level")
+    if level and level not in ("INFO", "WARNING", "CRITICAL"):
+        return jsonify({"error": "level 必须是 INFO, WARNING, CRITICAL 之一"}), 400
+    alerts = state.alert_manager.get_active_alerts(level=level)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "total": len(alerts),
+        "level_filter": level or "全部",
+        "alerts": [a.to_dict() for a in alerts],
+    })
+
+
+@app.route("/api/alerts/<alert_id>", methods=["GET"])
+def get_alert_detail(alert_id):
+    """查询单条告警详情"""
+    alert = state.alert_manager.get_alert(alert_id)
+    if alert is None:
+        return jsonify({"error": f"未找到告警: {alert_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "alert": alert.to_dict(),
+    })
+
+
+@app.route("/api/alerts/<alert_id>/escalation-history", methods=["GET"])
+def get_alert_escalation_history(alert_id):
+    """查询告警升级历史时间线"""
+    history = state.alert_manager.get_alert_escalation_history(alert_id)
+    if history is None:
+        return jsonify({"error": f"未找到告警: {alert_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "alert_id": alert_id,
+        "total_events": len(history),
+        "timeline": history,
+    })
+
+
+@app.route("/api/alerts/<alert_id>/acknowledge", methods=["POST"])
+def acknowledge_alert(alert_id):
+    """确认单条告警，确认后停止升级流程"""
+    data = request.get_json(silent=True) or {}
+    acknowledged_by = data.get("acknowledged_by")
+    success = state.alert_manager.acknowledge_alert(alert_id, acknowledged_by)
+    if not success:
+        return jsonify({"error": f"未找到告警或已确认: {alert_id}"}), 404
+    alert = state.alert_manager.get_alert(alert_id)
+    return jsonify({
+        "status": "ok",
+        "message": f"告警 {alert_id} 已确认",
+        "alert": alert.to_dict() if alert else None,
+    })
+
+
+@app.route("/api/alerts/acknowledge-by-type", methods=["POST"])
+def acknowledge_alerts_by_type():
+    """批量确认同类型的所有未确认告警"""
+    data = request.get_json(silent=True) or {}
+    alert_type = data.get("alert_type")
+    acknowledged_by = data.get("acknowledged_by")
+    if not alert_type:
+        return jsonify({"error": "缺少必填字段: alert_type"}), 400
+    count = state.alert_manager.acknowledge_alerts_by_type(alert_type, acknowledged_by)
+    return jsonify({
+        "status": "ok",
+        "message": f"已确认 {count} 条 {alert_type} 类型告警",
+        "acknowledged_count": count,
+        "alert_type": alert_type,
+    })
+
+
+@app.route("/api/alerts/check-escalation", methods=["POST"])
+def check_alerts_escalation():
+    """手动触发基于时间的告警升级检查（WARNING -> CRITICAL）"""
+    state.alert_manager.process_pending_notifications()
+    escalated = state.alert_manager.check_time_based_escalation()
+    return jsonify({
+        "status": "ok",
+        "message": f"已检查升级，{len(escalated)} 条告警升级为紧急级别",
+        "escalated_count": len(escalated),
+        "escalated_alerts": [a.to_dict() for a in escalated],
+    })
+
+
+@app.route("/api/alerts/statistics", methods=["GET"])
+def get_alert_statistics():
+    """告警统计：按类型和级别聚合的计数，最近24小时的告警趋势"""
+    stats = state.alert_manager.get_alert_statistics()
+    return jsonify({
+        "status": "ok",
+        "statistics": stats,
+    })
+
+
+@app.route("/api/duty/staff", methods=["GET"])
+def list_duty_staff():
+    """查询所有值班人员配置"""
+    staff_list = state.alert_manager.list_duty_staff()
+    now = datetime.now()
+    current_on_duty = [s.staff_id for s in state.alert_manager.get_on_duty_staff(now)]
+    result = []
+    for s in staff_list:
+        d = s.to_dict()
+        d["is_on_duty_now"] = s.staff_id in current_on_duty
+        result.append(d)
+    return jsonify({
+        "status": "ok",
+        "query_time": now.isoformat(),
+        "total": len(result),
+        "staff": result,
+    })
+
+
+@app.route("/api/duty/staff", methods=["POST"])
+def add_duty_staff():
+    """新增值班人员配置"""
+    data = request.get_json(silent=True) or {}
+    required = ["name", "contact", "start_hour", "end_hour"]
+    for f in required:
+        if f not in data:
+            return jsonify({"error": f"缺少必填字段: {f}"}), 400
+    try:
+        start_hour = int(data["start_hour"])
+        end_hour = int(data["end_hour"])
+    except (ValueError, TypeError):
+        return jsonify({"error": "start_hour 和 end_hour 必须是整数"}), 400
+    try:
+        staff = state.alert_manager.add_duty_staff(
+            name=data["name"],
+            contact=data["contact"],
+            start_hour=start_hour,
+            end_hour=end_hour,
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({
+        "status": "ok",
+        "message": "值班人员添加成功",
+        "staff": staff.to_dict(),
+    })
+
+
+@app.route("/api/duty/staff/<staff_id>", methods=["GET"])
+def get_duty_staff_detail(staff_id):
+    """查询单个值班人员配置"""
+    staff = state.alert_manager.get_duty_staff(staff_id)
+    if staff is None:
+        return jsonify({"error": f"未找到值班人员: {staff_id}"}), 404
+    now = datetime.now()
+    d = staff.to_dict()
+    d["is_on_duty_now"] = state.alert_manager.is_on_duty(staff, now)
+    return jsonify({
+        "status": "ok",
+        "query_time": now.isoformat(),
+        "staff": d,
+    })
+
+
+@app.route("/api/duty/staff/<staff_id>", methods=["PUT"])
+def update_duty_staff(staff_id):
+    """修改值班人员配置"""
+    data = request.get_json(silent=True) or {}
+    start_hour = data.get("start_hour")
+    end_hour = data.get("end_hour")
+    if start_hour is not None:
+        try:
+            start_hour = int(start_hour)
+        except (ValueError, TypeError):
+            return jsonify({"error": "start_hour 必须是整数"}), 400
+    if end_hour is not None:
+        try:
+            end_hour = int(end_hour)
+        except (ValueError, TypeError):
+            return jsonify({"error": "end_hour 必须是整数"}), 400
+    try:
+        success = state.alert_manager.update_duty_staff(
+            staff_id=staff_id,
+            name=data.get("name"),
+            contact=data.get("contact"),
+            start_hour=start_hour,
+            end_hour=end_hour,
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not success:
+        return jsonify({"error": f"未找到值班人员: {staff_id}"}), 404
+    staff = state.alert_manager.get_duty_staff(staff_id)
+    return jsonify({
+        "status": "ok",
+        "message": "值班人员配置已更新",
+        "staff": staff.to_dict() if staff else None,
+    })
+
+
+@app.route("/api/duty/staff/<staff_id>", methods=["DELETE"])
+def delete_duty_staff(staff_id):
+    """删除值班人员配置"""
+    success = state.alert_manager.delete_duty_staff(staff_id)
+    if not success:
+        return jsonify({"error": f"未找到值班人员: {staff_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "message": "值班人员已删除",
+        "staff_id": staff_id,
+    })
+
+
+@app.route("/api/duty/on-duty-now", methods=["GET"])
+def get_on_duty_now():
+    """查询当前谁在值班"""
+    now = datetime.now()
+    on_duty = state.alert_manager.get_on_duty_staff(now)
+    next_time = state.alert_manager.get_next_on_duty_time(now)
+    return jsonify({
+        "status": "ok",
+        "query_time": now.isoformat(),
+        "current_hour": now.hour,
+        "on_duty_count": len(on_duty),
+        "on_duty": [s.to_dict() for s in on_duty],
+        "next_on_duty_time": next_time.isoformat() if next_time else None,
+        "has_on_duty": len(on_duty) > 0,
+    })
+
+
+@app.route("/api/duty/notifications", methods=["GET"])
+def get_notifications():
+    """查询通知队列（已发送/待发送/无人接收）"""
+    status = request.args.get("status")
+    valid_statuses = ("pending", "sent", "unattended")
+    if status and status not in valid_statuses:
+        return jsonify({"error": f"status 必须是 {valid_statuses} 之一"}), 400
+    state.alert_manager.process_pending_notifications()
+    notifications = state.alert_manager.get_notifications(status=status)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "status_filter": status or "全部",
+        "total": len(notifications),
+        "notifications": [n.to_dict() for n in notifications],
+    })
+
+
+@app.route("/api/duty/notifications/process", methods=["POST"])
+def process_notifications():
+    """手动处理待发送/无人接收的通知"""
+    now = datetime.now()
+    state.alert_manager.process_pending_notifications(now)
+    all_notifications = state.alert_manager.get_notifications()
+    stats = {
+        "total": len(all_notifications),
+        "sent": len([n for n in all_notifications if n.status == "sent"]),
+        "pending": len([n for n in all_notifications if n.status == "pending"]),
+        "unattended": len([n for n in all_notifications if n.status == "unattended"]),
+    }
+    return jsonify({
+        "status": "ok",
+        "message": "通知队列已处理",
+        "statistics": stats,
+    })
+
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({
@@ -1865,6 +2130,11 @@ def health_check():
         },
         "daily_report_count": len(state.daily_reports),
         "weekly_report_count": len(state.weekly_reports),
+        "alert_manager": {
+            "active_alerts": len(state.alert_manager.get_active_alerts()),
+            "duty_staff_count": len(state.alert_manager.list_duty_staff()),
+            "notification_count": len(state.alert_manager.get_notifications()),
+        },
     })
 
 
@@ -1897,7 +2167,22 @@ def _list_endpoints():
         "GET /api/status/load - 负荷状态",
         "GET /api/dispatch/history - 调度历史",
         "GET /api/stats/accumulated - 累计统计",
-        "GET /api/alerts - 告警记录",
+        "GET /api/alerts - 告警记录（原始列表）",
+        "GET /api/alerts/active - 活跃告警列表（按级别筛选，按时间排序）",
+        "GET /api/alerts/<alert_id> - 单条告警详情",
+        "GET /api/alerts/<alert_id>/escalation-history - 告警升级历史时间线",
+        "POST /api/alerts/<alert_id>/acknowledge - 确认单条告警",
+        "POST /api/alerts/acknowledge-by-type - 批量确认同类型告警",
+        "POST /api/alerts/check-escalation - 手动触发告警升级检查",
+        "GET /api/alerts/statistics - 告警统计（按类型/级别聚合，24小时趋势）",
+        "GET /api/duty/staff - 值班人员列表",
+        "POST /api/duty/staff - 新增值班人员",
+        "GET /api/duty/staff/<staff_id> - 单个值班人员详情",
+        "PUT /api/duty/staff/<staff_id> - 修改值班人员配置",
+        "DELETE /api/duty/staff/<staff_id> - 删除值班人员",
+        "GET /api/duty/on-duty-now - 当前值班人员状态",
+        "GET /api/duty/notifications - 通知队列（已发送/待发送/无人接收）",
+        "POST /api/duty/notifications/process - 手动处理通知队列",
         "GET /api/source/health - 所有发电源健康评分",
         "GET /api/source/health/<type>/<id> - 单个发电源健康评分",
         "GET /api/source/health/<type>/<id>/history - 发电源健康评分历史趋势",
