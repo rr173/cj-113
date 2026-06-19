@@ -422,6 +422,16 @@ class MicrogridState:
         for gid in config.LOAD_GROUP_CONFIG:
             self.load_group_reliability_history[gid] = []
 
+        self.power_pressure_index: float = 0.0
+        self.power_pressure_history: List[Dict[str, Any]] = []
+        self.current_shed_mode: str = "normal"
+        self.shed_mode_history: List[Dict[str, Any]] = []
+        self.shed_mode_manual_lock: bool = False
+        self.shed_mode_manual_mode: Optional[str] = None
+        self.emergency_shed_extra_kw: Dict[str, float] = {}
+        self.emergency_shed_extra_initial: Dict[str, float] = {}
+        self.pending_restore_from_emergency: bool = False
+
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
             self.pv_reports[report.source_id] = report
@@ -1596,3 +1606,476 @@ class MicrogridState:
     def generate_load_group_event_id(self) -> str:
         self._load_group_event_counter += 1
         return f"SHED-{self._load_group_event_counter:06d}"
+
+    def compute_power_pressure_index(self, now: datetime) -> float:
+        if not config.DYNAMIC_SHED_CONFIG.get("enable_dynamic_shed", False):
+            return 0.0
+
+        cfg = config.DYNAMIC_SHED_CONFIG
+        score = 0.0
+        breakdown = {}
+
+        bes_id = list(config.BESS_CONFIG.keys())[0]
+        bs = self.bess_state.get(bes_id)
+        if bs and bs.soc < cfg["score_low_soc_threshold"]:
+            score += cfg["score_low_soc"]
+            breakdown["low_soc"] = cfg["score_low_soc"]
+        else:
+            breakdown["low_soc"] = 0
+
+        total_load = self.get_load_kw()
+        total_renewable = self.get_total_renewable_kw()
+        if total_load > 0 and total_renewable / total_load < cfg["score_low_renewable_ratio"]:
+            score += cfg["score_low_renewable"]
+            breakdown["low_renewable"] = cfg["score_low_renewable"]
+        else:
+            breakdown["low_renewable"] = 0
+
+        diesel_running = any(ds.running for ds in self.diesel_state.values())
+        if diesel_running:
+            score += cfg["score_diesel_running"]
+            breakdown["diesel_running"] = cfg["score_diesel_running"]
+        else:
+            breakdown["diesel_running"] = 0
+
+        tariff_period = config.get_tariff_period(now.hour)
+        if tariff_period == "peak":
+            score += cfg["score_peak_hour"]
+            breakdown["peak_hour"] = cfg["score_peak_hour"]
+        else:
+            breakdown["peak_hour"] = 0
+
+        shed_window = cfg["shed_history_window"]
+        recent_decisions = self.dispatch_history[-shed_window:] if len(self.dispatch_history) >= shed_window else self.dispatch_history
+        has_recent_shed = any(d.load_shed_kw > 0.01 for d in recent_decisions)
+        if has_recent_shed:
+            score += cfg["score_recent_shed"]
+            breakdown["recent_shed"] = cfg["score_recent_shed"]
+        else:
+            breakdown["recent_shed"] = 0
+
+        score = min(100.0, max(0.0, score))
+
+        self.power_pressure_index = score
+        history_entry = {
+            "timestamp": now,
+            "pressure_index": score,
+            "breakdown": breakdown,
+        }
+        self.power_pressure_history.append(history_entry)
+        if len(self.power_pressure_history) > cfg["pressure_history_size"]:
+            self.power_pressure_history = self.power_pressure_history[-cfg["pressure_history_size"]:]
+
+        return score
+
+    def determine_shed_mode(self, pressure_index: float) -> str:
+        cfg = config.DYNAMIC_SHED_CONFIG
+        if pressure_index < cfg["relaxed_mode_threshold"]:
+            return "relaxed"
+        elif pressure_index < cfg["emergency_mode_threshold"]:
+            return "normal"
+        else:
+            return "emergency"
+
+    def update_shed_mode(self, now: datetime, pressure_index: float) -> Tuple[str, bool, str]:
+        if self.shed_mode_manual_lock and self.shed_mode_manual_mode:
+            return self.current_shed_mode, False, "manual_lock"
+
+        new_mode = self.determine_shed_mode(pressure_index)
+        old_mode = self.current_shed_mode
+        mode_changed = new_mode != old_mode
+
+        if mode_changed:
+            reason = f"压力指数{pressure_index:.1f}触发模式切换"
+            history_entry = {
+                "timestamp": now,
+                "old_mode": old_mode,
+                "new_mode": new_mode,
+                "pressure_index": pressure_index,
+                "reason": reason,
+                "trigger": "auto",
+            }
+            self.shed_mode_history.append(history_entry)
+            if len(self.shed_mode_history) > config.DYNAMIC_SHED_CONFIG["mode_switch_history_size"]:
+                self.shed_mode_history = self.shed_mode_history[-config.DYNAMIC_SHED_CONFIG["mode_switch_history_size"]:]
+
+            if old_mode == "emergency" and new_mode != "emergency":
+                self.pending_restore_from_emergency = True
+                self.emergency_shed_extra_initial = {}
+                for gid in self.load_group_state:
+                    gs = self.load_group_state[gid]
+                    extra = self.emergency_shed_extra_kw.get(gid, 0.0)
+                    if extra > 0 and gs["current_shed_kw"] > 0:
+                        actual_extra = min(extra, gs["current_shed_kw"])
+                        self.emergency_shed_extra_kw[gid] = actual_extra
+                        self.emergency_shed_extra_initial[gid] = actual_extra
+                    else:
+                        self.emergency_shed_extra_kw[gid] = 0.0
+                        self.emergency_shed_extra_initial[gid] = 0.0
+            elif new_mode == "emergency":
+                self.pending_restore_from_emergency = False
+                self.emergency_shed_extra_kw = {}
+                self.emergency_shed_extra_initial = {}
+
+            self.current_shed_mode = new_mode
+
+        return new_mode, mode_changed, old_mode if mode_changed else ""
+
+    def get_dynamic_max_shed_ratio(self, group_id: str, mode: str = None) -> float:
+        if mode is None:
+            mode = self.current_shed_mode
+
+        if group_id not in self.load_group_state:
+            return 0.0
+
+        gs = self.load_group_state[group_id]
+        base_ratio = gs["max_shed_ratio"]
+
+        if mode == "relaxed":
+            if group_id == "group3":
+                return base_ratio * config.DYNAMIC_SHED_CONFIG["relaxed_group3_ratio_multiplier"]
+            elif group_id == "group2":
+                return base_ratio * config.DYNAMIC_SHED_CONFIG["relaxed_group2_ratio_multiplier"]
+            else:
+                return base_ratio
+        elif mode == "normal":
+            if group_id == "group3":
+                return base_ratio * config.DYNAMIC_SHED_CONFIG["normal_group3_ratio_multiplier"]
+            elif group_id == "group2":
+                return base_ratio * config.DYNAMIC_SHED_CONFIG["normal_group2_ratio_multiplier"]
+            else:
+                return base_ratio
+        elif mode == "emergency":
+            if group_id == "group3":
+                return min(1.0, base_ratio * config.DYNAMIC_SHED_CONFIG["emergency_group3_ratio_multiplier"])
+            elif group_id == "group2":
+                return min(
+                    config.DYNAMIC_SHED_CONFIG["emergency_group2_max_ratio"],
+                    base_ratio * config.DYNAMIC_SHED_CONFIG["emergency_group2_ratio_multiplier"]
+                )
+            else:
+                return base_ratio
+        else:
+            return base_ratio
+
+    def compute_priority_load_shedding_dynamic(self, gap_kw: float, now: datetime,
+                                                dispatch_id: str = None) -> Tuple[Dict[str, float], float]:
+        if not config.DYNAMIC_SHED_CONFIG.get("enable_dynamic_shed", False):
+            return self.compute_priority_load_shedding(gap_kw, now, dispatch_id)
+
+        if gap_kw <= 0:
+            for gid, gs in self.load_group_state.items():
+                reported = max(0.0, gs["reported_power_kw"])
+                gs["current_served_kw"] = max(0.0, reported - gs["current_shed_kw"])
+            return {}, 0.0
+
+        mode = self.current_shed_mode
+        bes_id = list(config.BESS_CONFIG.keys())[0]
+        bs = self.bess_state.get(bes_id)
+        soc = bs.soc if bs else 1.0
+
+        forced_shed = {}
+        if mode == "emergency" and soc < config.DYNAMIC_SHED_CONFIG["emergency_forced_shed_soc_threshold"]:
+            for gid, gs in self.load_group_state.items():
+                if gid == "group3":
+                    reported = max(0.0, gs["reported_power_kw"])
+                    dynamic_ratio = self.get_dynamic_max_shed_ratio(gid, mode)
+                    max_shed_allowed = reported * dynamic_ratio
+                    additional_needed = max(0.0, max_shed_allowed - gs["current_shed_kw"])
+                    if additional_needed > 0.01:
+                        forced_shed[gid] = additional_needed
+
+        remaining_gap = gap_kw
+        shed_by_group: Dict[str, float] = {}
+        pre_shed_by_group = {}
+
+        for gid, gs in self.load_group_state.items():
+            reported = max(0.0, gs["reported_power_kw"])
+            gs["current_served_kw"] = max(0.0, reported - gs["current_shed_kw"])
+            pre_shed_by_group[gid] = gs["current_shed_kw"]
+
+        if forced_shed:
+            for gid, kw in forced_shed.items():
+                if gid not in shed_by_group:
+                    shed_by_group[gid] = 0.0
+                gs = self.load_group_state[gid]
+                reported = max(0.0, gs["reported_power_kw"])
+                additional_shed = min(kw, reported - gs["current_shed_kw"])
+                if additional_shed > 0.01:
+                    shed_by_group[gid] += additional_shed
+                    gs["current_shed_kw"] += additional_shed
+                    gs["current_served_kw"] = max(0.0, reported - gs["current_shed_kw"])
+                    remaining_gap = max(0.0, remaining_gap - additional_shed)
+
+                    if gid not in self._active_shed_events or self._active_shed_events[gid].shed_power_kw <= 0:
+                        self._load_group_event_counter += 1
+                        event_id = f"SHED-{self._load_group_event_counter:06d}"
+                        event = LoadGroupShedEvent(
+                            event_id=event_id,
+                            group_id=gid,
+                            group_name=gs["name"],
+                            shed_power_kw=gs["current_shed_kw"],
+                            started_at=now,
+                            reason=f"紧急模式强制切除(SOC<{config.DYNAMIC_SHED_CONFIG['emergency_forced_shed_soc_threshold']*100:.0f}%)",
+                            dispatch_id=dispatch_id,
+                        )
+                        self.load_group_shed_events.append(event)
+                        self._active_shed_events[gid] = event
+                    else:
+                        event = self._active_shed_events[gid]
+                        event.shed_power_kw = gs["current_shed_kw"]
+
+        if remaining_gap > 0.01:
+            sorted_by_shed = sorted(
+                self.load_group_state.items(),
+                key=lambda x: x[1]["shed_priority"],
+                reverse=True,
+            )
+
+            for gid, gs in sorted_by_shed:
+                if remaining_gap <= 0:
+                    break
+
+                reported = max(0.0, gs["reported_power_kw"])
+                currently_served = reported - gs["current_shed_kw"]
+                dynamic_max_ratio = self.get_dynamic_max_shed_ratio(gid, mode)
+                max_shed_allowed = reported * dynamic_max_ratio
+                additional_can_shed = max(0.0, max_shed_allowed - gs["current_shed_kw"])
+                can_serve_min = max(0.0, reported - max_shed_allowed)
+                additional_shed = min(remaining_gap, additional_can_shed, currently_served - can_serve_min)
+
+                if additional_shed > 0.01:
+                    if gid not in shed_by_group:
+                        shed_by_group[gid] = 0.0
+                    shed_by_group[gid] += additional_shed
+                    remaining_gap -= additional_shed
+                    new_total_shed = gs["current_shed_kw"] + additional_shed
+                    gs["current_shed_kw"] = new_total_shed
+                    gs["current_served_kw"] = max(0.0, reported - new_total_shed)
+
+                    if gid not in self._active_shed_events or self._active_shed_events[gid].shed_power_kw <= 0:
+                        self._load_group_event_counter += 1
+                        event_id = f"SHED-{self._load_group_event_counter:06d}"
+                        event = LoadGroupShedEvent(
+                            event_id=event_id,
+                            group_id=gid,
+                            group_name=gs["name"],
+                            shed_power_kw=new_total_shed,
+                            started_at=now,
+                            reason=f"供电缺口{gap_kw:.2f}kW，按优先级切除负荷({mode}模式)",
+                            dispatch_id=dispatch_id,
+                        )
+                        self.load_group_shed_events.append(event)
+                        self._active_shed_events[gid] = event
+                    else:
+                        event = self._active_shed_events[gid]
+                        event.shed_power_kw = new_total_shed
+                elif gid in self._active_shed_events and self._active_shed_events[gid].shed_power_kw > 0:
+                    event = self._active_shed_events[gid]
+                    event.shed_power_kw = gs["current_shed_kw"]
+
+        if mode == "emergency":
+            for gid in shed_by_group:
+                gs = self.load_group_state[gid]
+                pre_shed = pre_shed_by_group.get(gid, 0.0)
+                added = gs["current_shed_kw"] - pre_shed
+                if added > 0.01:
+                    if gid not in self.emergency_shed_extra_kw:
+                        self.emergency_shed_extra_kw[gid] = 0.0
+                    self.emergency_shed_extra_kw[gid] += added
+
+        total_shed = sum(shed_by_group.values())
+        return shed_by_group, remaining_gap
+
+    def restore_load_groups_dynamic(self, surplus_kw: float, now: datetime,
+                                     dispatch_id: str = None) -> Tuple[Dict[str, float], float]:
+        if not config.DYNAMIC_SHED_CONFIG.get("enable_dynamic_shed", False):
+            return self.restore_load_groups(surplus_kw, now, dispatch_id)
+
+        if surplus_kw <= 0:
+            return {}, 0.0
+
+        mode = self.current_shed_mode
+        available_surplus = surplus_kw
+
+        if self.pending_restore_from_emergency:
+            total_initial_extra = sum(self.emergency_shed_extra_initial.values())
+            if total_initial_extra <= 0.01:
+                total_initial_extra = sum(self.emergency_shed_extra_kw.values())
+                for gid, kw in self.emergency_shed_extra_kw.items():
+                    self.emergency_shed_extra_initial[gid] = kw
+            if total_initial_extra > 0.01:
+                max_restore_this_cycle = total_initial_extra * config.DYNAMIC_SHED_CONFIG["restore_rate_per_cycle"]
+                available_surplus = min(surplus_kw, max_restore_this_cycle)
+
+        remaining_surplus = available_surplus
+        restored_by_group: Dict[str, float] = {}
+
+        sorted_by_restore = sorted(
+            self.load_group_state.items(),
+            key=lambda x: x[1]["restore_priority"],
+        )
+
+        for gid, gs in sorted_by_restore:
+            if remaining_surplus <= 0:
+                break
+            if gs["current_shed_kw"] <= 0:
+                continue
+
+            restore_amount = min(remaining_surplus, gs["current_shed_kw"])
+
+            if self.pending_restore_from_emergency:
+                extra_for_group = self.emergency_shed_extra_kw.get(gid, 0.0)
+                if extra_for_group > 0.01:
+                    restore_amount = min(restore_amount, extra_for_group)
+                else:
+                    continue
+
+            if restore_amount > 0.01:
+                restored_by_group[gid] = restore_amount
+                remaining_surplus -= restore_amount
+                new_shed = gs["current_shed_kw"] - restore_amount
+                gs["current_shed_kw"] = new_shed
+                reported = max(0.0, gs["reported_power_kw"])
+                gs["current_served_kw"] = reported - new_shed
+
+                if gid in self.emergency_shed_extra_kw:
+                    self.emergency_shed_extra_kw[gid] = max(0.0, self.emergency_shed_extra_kw[gid] - restore_amount)
+
+                if gid in self._active_shed_events:
+                    event = self._active_shed_events[gid]
+                    if new_shed <= 0.01:
+                        event.ended_at = now
+                        event.duration_minutes = (now - event.started_at).total_seconds() / 60.0
+                        del self._active_shed_events[gid]
+                    else:
+                        event.shed_power_kw = new_shed
+
+        if self.pending_restore_from_emergency:
+            total_extra_remaining = sum(self.emergency_shed_extra_kw.values())
+            if total_extra_remaining < 0.01:
+                self.pending_restore_from_emergency = False
+                self.emergency_shed_extra_kw = {}
+
+        leftover_surplus = surplus_kw - available_surplus + remaining_surplus
+        total_restored = sum(restored_by_group.values())
+        return restored_by_group, leftover_surplus
+
+    def get_power_pressure_info(self) -> Dict[str, Any]:
+        return {
+            "current_pressure_index": round(self.power_pressure_index, 2),
+            "current_mode": self.current_shed_mode,
+            "current_mode_chinese": {
+                "relaxed": "宽松模式",
+                "normal": "正常模式",
+                "emergency": "紧急模式",
+            }.get(self.current_shed_mode, "未知"),
+            "manual_lock": self.shed_mode_manual_lock,
+            "manual_mode": self.shed_mode_manual_mode,
+        }
+
+    def get_power_pressure_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        history = self.power_pressure_history[-limit:]
+        result = []
+        for entry in reversed(history):
+            result.append({
+                "timestamp": entry["timestamp"].isoformat() if isinstance(entry["timestamp"], datetime) else entry["timestamp"],
+                "pressure_index": round(entry["pressure_index"], 2),
+                "breakdown": entry.get("breakdown", {}),
+            })
+        return result
+
+    def get_dynamic_shed_limits(self) -> Dict[str, Any]:
+        result = {}
+        mode = self.current_shed_mode
+        for gid, gs in self.load_group_state.items():
+            base_ratio = gs["max_shed_ratio"]
+            dynamic_ratio = self.get_dynamic_max_shed_ratio(gid, mode)
+            reported = max(0.0, gs["reported_power_kw"])
+            result[gid] = {
+                "group_id": gid,
+                "name": gs["name"],
+                "configured_max_shed_ratio": base_ratio,
+                "dynamic_max_shed_ratio": round(dynamic_ratio, 4),
+                "configured_max_shed_kw": round(reported * base_ratio, 2),
+                "dynamic_max_shed_kw": round(reported * dynamic_ratio, 2),
+                "current_shed_kw": round(gs["current_shed_kw"], 2),
+                "shed_priority": gs["shed_priority"],
+            }
+        return result
+
+    def get_shed_mode_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        history = self.shed_mode_history[-limit:]
+        result = []
+        for entry in reversed(history):
+            result.append({
+                "timestamp": entry["timestamp"].isoformat() if isinstance(entry["timestamp"], datetime) else entry["timestamp"],
+                "old_mode": entry["old_mode"],
+                "old_mode_chinese": {
+                    "relaxed": "宽松模式",
+                    "normal": "正常模式",
+                    "emergency": "紧急模式",
+                }.get(entry["old_mode"], "未知"),
+                "new_mode": entry["new_mode"],
+                "new_mode_chinese": {
+                    "relaxed": "宽松模式",
+                    "normal": "正常模式",
+                    "emergency": "紧急模式",
+                }.get(entry["new_mode"], "未知"),
+                "pressure_index": round(entry["pressure_index"], 2),
+                "reason": entry["reason"],
+                "trigger": entry.get("trigger", "auto"),
+            })
+        return result
+
+    def set_shed_mode_manual_lock(self, lock: bool, mode: str = None) -> bool:
+        if lock:
+            if mode not in ("relaxed", "normal", "emergency"):
+                return False
+            self.shed_mode_manual_lock = True
+            self.shed_mode_manual_mode = mode
+            old_mode = self.current_shed_mode
+            if old_mode != mode:
+                history_entry = {
+                    "timestamp": datetime.now(),
+                    "old_mode": old_mode,
+                    "new_mode": mode,
+                    "pressure_index": self.power_pressure_index,
+                    "reason": "手动锁定模式",
+                    "trigger": "manual",
+                }
+                self.shed_mode_history.append(history_entry)
+                if len(self.shed_mode_history) > config.DYNAMIC_SHED_CONFIG["mode_switch_history_size"]:
+                    self.shed_mode_history = self.shed_mode_history[-config.DYNAMIC_SHED_CONFIG["mode_switch_history_size"]:]
+                self.current_shed_mode = mode
+
+                if old_mode == "emergency" and mode != "emergency":
+                    self.pending_restore_from_emergency = True
+                    self.emergency_shed_extra_initial = {}
+                    for gid in self.load_group_state:
+                        gs = self.load_group_state[gid]
+                        extra = self.emergency_shed_extra_kw.get(gid, 0.0)
+                        if extra > 0 and gs["current_shed_kw"] > 0:
+                            actual_extra = min(extra, gs["current_shed_kw"])
+                            self.emergency_shed_extra_kw[gid] = actual_extra
+                            self.emergency_shed_extra_initial[gid] = actual_extra
+                        else:
+                            self.emergency_shed_extra_kw[gid] = 0.0
+                            self.emergency_shed_extra_initial[gid] = 0.0
+                elif mode == "emergency":
+                    self.pending_restore_from_emergency = False
+                    self.emergency_shed_extra_kw = {}
+                    self.emergency_shed_extra_initial = {}
+        else:
+            self.shed_mode_manual_lock = False
+            self.shed_mode_manual_mode = None
+        return True
+
+    def get_emergency_restore_status(self) -> Dict[str, Any]:
+        total_extra = sum(self.emergency_shed_extra_kw.values())
+        return {
+            "pending_restore": self.pending_restore_from_emergency,
+            "total_extra_shed_kw": round(total_extra, 2),
+            "extra_shed_by_group": {gid: round(kw, 2) for gid, kw in self.emergency_shed_extra_kw.items()},
+            "restore_rate_per_cycle": config.DYNAMIC_SHED_CONFIG["restore_rate_per_cycle"],
+        }

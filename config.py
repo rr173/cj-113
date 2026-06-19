@@ -138,3 +138,29 @@ def get_peak_price() -> float:
 
 def get_flat_price() -> float:
     return GRID_TARIFF["flat"]["price"]
+
+
+DYNAMIC_SHED_CONFIG = {
+    "enable_dynamic_shed": True,
+    "pressure_history_size": 50,
+    "shed_history_window": 5,
+    "mode_switch_history_size": 50,
+    "relaxed_mode_threshold": 30,
+    "emergency_mode_threshold": 70,
+    "relaxed_group3_ratio_multiplier": 0.5,
+    "relaxed_group2_ratio_multiplier": 0.0,
+    "normal_group3_ratio_multiplier": 1.0,
+    "normal_group2_ratio_multiplier": 1.0,
+    "emergency_group3_ratio_multiplier": 1.0,
+    "emergency_group2_ratio_multiplier": 1.5,
+    "emergency_group2_max_ratio": 1.0,
+    "emergency_forced_shed_soc_threshold": 0.25,
+    "restore_rate_per_cycle": 0.3,
+    "score_low_soc": 30,
+    "score_low_soc_threshold": 0.30,
+    "score_low_renewable": 20,
+    "score_low_renewable_ratio": 0.50,
+    "score_diesel_running": 15,
+    "score_peak_hour": 10,
+    "score_recent_shed": 25,
+}

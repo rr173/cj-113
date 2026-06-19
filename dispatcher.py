@@ -183,6 +183,31 @@ class DispatchEngine:
                 {"mode": "normal"}
             )
 
+        dynamic_shed_enabled = config.DYNAMIC_SHED_CONFIG.get("enable_dynamic_shed", False)
+        if dynamic_shed_enabled:
+            pressure_index = self.state.compute_power_pressure_index(now)
+            new_mode, mode_changed, old_mode = self.state.update_shed_mode(now, pressure_index)
+            mode_cn = {"relaxed": "宽松模式", "normal": "正常模式", "emergency": "紧急模式"}.get(new_mode, new_mode)
+            notes.append(f"供电压力指数: {pressure_index:.1f}，当前模式: {mode_cn}")
+            if mode_changed:
+                old_mode_cn = {"relaxed": "宽松模式", "normal": "正常模式", "emergency": "紧急模式"}.get(old_mode, old_mode)
+                notes.append(f"模式切换: {old_mode_cn} → {mode_cn} (压力指数{pressure_index:.1f})")
+            audit_builder.add_branch(
+                "动态限额模式",
+                True,
+                f"供电压力指数{pressure_index:.1f}，当前模式: {mode_cn}",
+                {"pressure_index": pressure_index, "mode": new_mode, "mode_chinese": mode_cn,
+                 "mode_changed": mode_changed, "old_mode": old_mode if mode_changed else None,
+                 "manual_lock": self.state.shed_mode_manual_lock}
+            )
+        else:
+            audit_builder.add_branch(
+                "动态限额模式",
+                False,
+                "动态限额功能未启用",
+                {"mode": "normal"}
+            )
+
         backup_plans = self.state.get_active_backup_plans()
         if backup_plans:
             audit_builder.add_branch(
@@ -326,7 +351,7 @@ class DispatchEngine:
 
             if remaining_load > 0:
                 total_available = renewable_for_load + diesel_output[ds_id] + (grid_import_kw - bess_action[bes_id]["charge_kw"] + charge_from_renewable)
-                shed_result, unshed_gap = self.state.compute_priority_load_shedding(
+                shed_result, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
                     remaining_load, now, dispatch_id
                 )
                 total_shed_actual = sum(shed_result.values())
@@ -365,7 +390,7 @@ class DispatchEngine:
                 if prev_active_shed_count > 0:
                     surplus_for_restore = -remaining_load
                     if surplus_for_restore > 0:
-                        restored, leftover = self.state.restore_load_groups(
+                        restored, leftover = self.state.restore_load_groups_dynamic(
                             surplus_for_restore, now, dispatch_id
                         )
                         if restored:
@@ -489,7 +514,7 @@ class DispatchEngine:
 
                 if remaining_load > 0:
                     total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
-                    shed_result, unshed_gap = self.state.compute_priority_load_shedding(
+                    shed_result, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
                         remaining_load, now, dispatch_id
                     )
                     total_shed_actual = sum(shed_result.values())
@@ -531,7 +556,7 @@ class DispatchEngine:
                     if prev_active_shed_count > 0 and remaining_load < 0:
                         surplus_for_restore = -remaining_load
                         if surplus_for_restore > 0:
-                            restored, leftover = self.state.restore_load_groups(
+                            restored, leftover = self.state.restore_load_groups_dynamic(
                                 surplus_for_restore, now, dispatch_id
                             )
                             if restored:
@@ -591,7 +616,7 @@ class DispatchEngine:
 
                 total_surplus_for_restore = (-remaining_load)
                 if prev_active_shed_count > 0 and total_surplus_for_restore > 0:
-                    restored, leftover = self.state.restore_load_groups(
+                    restored, leftover = self.state.restore_load_groups_dynamic(
                         total_surplus_for_restore, now, dispatch_id
                     )
                     if restored:
@@ -753,7 +778,7 @@ class DispatchEngine:
 
                     if remaining_load > 0:
                         total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
-                        shed_result, unshed_gap = self.state.compute_priority_load_shedding(
+                        shed_result, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
                             remaining_load, now, dispatch_id
                         )
                         total_shed_actual = sum(shed_result.values())
@@ -795,7 +820,7 @@ class DispatchEngine:
                         if prev_active_shed_count > 0 and remaining_load < 0:
                             surplus_for_restore = -remaining_load
                             if surplus_for_restore > 0:
-                                restored, leftover = self.state.restore_load_groups(
+                                restored, leftover = self.state.restore_load_groups_dynamic(
                                     surplus_for_restore, now, dispatch_id
                                 )
                                 if restored:
@@ -871,7 +896,7 @@ class DispatchEngine:
 
                 total_surplus_for_restore = (-remaining_load)
                 if prev_active_shed_count > 0 and total_surplus_for_restore > 0:
-                    restored, leftover = self.state.restore_load_groups(
+                    restored, leftover = self.state.restore_load_groups_dynamic(
                         total_surplus_for_restore, now, dispatch_id
                     )
                     if restored:
