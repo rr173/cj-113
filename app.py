@@ -1093,6 +1093,135 @@ def get_fault_events():
     })
 
 
+@app.route("/api/dynamic-shed/pressure", methods=["GET"])
+def get_power_pressure():
+    """
+    查询当前供电压力指数和模式
+    返回: 当前压力指数、模式、中文模式名、是否手动锁定
+    """
+    info = state.get_power_pressure_info()
+    restore_status = state.get_emergency_restore_status()
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "pressure": info,
+        "emergency_restore": restore_status,
+    })
+
+
+@app.route("/api/dynamic-shed/pressure/history", methods=["GET"])
+def get_power_pressure_history_api():
+    """
+    查询压力指数历史趋势（最近50个点）
+    参数: limit (可选，默认50)
+    """
+    try:
+        limit = int(request.args.get("limit", 50))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+
+    history = state.get_power_pressure_history(limit=limit)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "total_points": len(state.power_pressure_history),
+        "returned": len(history),
+        "history": history,
+    })
+
+
+@app.route("/api/dynamic-shed/limits", methods=["GET"])
+def get_dynamic_shed_limits_api():
+    """
+    查询各群组当前动态限额（实际生效的切除比例vs配置的切除比例）
+    """
+    limits = state.get_dynamic_shed_limits()
+    pressure_info = state.get_power_pressure_info()
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "current_mode": pressure_info["current_mode"],
+        "current_mode_chinese": pressure_info["current_mode_chinese"],
+        "pressure_index": pressure_info["current_pressure_index"],
+        "groups": limits,
+    })
+
+
+@app.route("/api/dynamic-shed/mode-history", methods=["GET"])
+def get_shed_mode_history_api():
+    """
+    查询模式切换历史记录（什么时候从哪个模式切到哪个模式、触发原因）
+    参数: limit (可选，默认50)
+    """
+    try:
+        limit = int(request.args.get("limit", 50))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+
+    history = state.get_shed_mode_history(limit=limit)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "total_switches": len(state.shed_mode_history),
+        "returned": len(history),
+        "current_mode": state.current_shed_mode,
+        "manual_lock": state.shed_mode_manual_lock,
+        "history": history,
+    })
+
+
+@app.route("/api/dynamic-shed/mode-lock", methods=["POST"])
+def set_shed_mode_lock():
+    """
+    手动锁定/解锁模式
+    请求体: {
+        "lock": true/false,        (true=锁定, false=解锁)
+        "mode": "emergency"         (lock=true时必填，可选值: relaxed/normal/emergency)
+    }
+    锁定后不再自动切换，直到手动解锁
+    """
+    data = request.get_json(force=True)
+    if "lock" not in data:
+        return jsonify({"error": "缺少必填字段: lock"}), 400
+
+    lock = bool(data["lock"])
+    mode = data.get("mode")
+
+    valid_modes = {"relaxed", "normal", "emergency"}
+    if lock:
+        if mode not in valid_modes:
+            return jsonify({"error": f"lock=true时mode必须是 {valid_modes} 之一"}), 400
+
+    success = state.set_shed_mode_manual_lock(lock, mode)
+    if not success:
+        return jsonify({"error": "模式设置失败，无效的mode值"}), 400
+
+    pressure_info = state.get_power_pressure_info()
+    mode_history = state.get_shed_mode_history(limit=1)
+
+    return jsonify({
+        "status": "ok",
+        "message": "模式已锁定" if lock else "模式已解锁，恢复自动切换",
+        "lock": lock,
+        "manual_mode": mode if lock else None,
+        "current_mode": pressure_info["current_mode"],
+        "current_mode_chinese": pressure_info["current_mode_chinese"],
+        "pressure_index": pressure_info["current_pressure_index"],
+        "latest_switch": mode_history[0] if mode_history else None,
+    })
+
+
+@app.route("/api/dynamic-shed/config", methods=["GET"])
+def get_dynamic_shed_config():
+    """查询动态限额功能的当前配置参数"""
+    cfg = config.DYNAMIC_SHED_CONFIG
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "config": cfg,
+    })
+
+
 @app.route("/api/config/tariff", methods=["PUT"])
 def update_tariff_config():
     """
@@ -1279,6 +1408,12 @@ def _list_endpoints():
         "GET /api/backup-plans - 备用预案列表",
         "GET /api/backup-plans/<type>/<id> - 单源备用预案",
         "GET /api/fault-events - 故障事件记录",
+        "GET /api/dynamic-shed/pressure - 当前供电压力指数和模式",
+        "GET /api/dynamic-shed/pressure/history - 压力指数历史趋势",
+        "GET /api/dynamic-shed/limits - 各群组当前动态限额",
+        "GET /api/dynamic-shed/mode-history - 模式切换历史记录",
+        "POST /api/dynamic-shed/mode-lock - 手动锁定/解锁模式",
+        "GET /api/dynamic-shed/config - 动态限额功能配置参数",
         "PUT /api/config/tariff - 修改电价配置",
         "PUT /api/config/bess_soc - 修改SOC区间",
         "GET /api/config/all - 查看全部配置",

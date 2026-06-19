@@ -1033,7 +1033,57 @@ class DispatchEngine:
         self.state.stats.total_grid_export_kwh += grid_export_kw * time_interval_hours
         self.state.stats.load_grid_import_kwh += load_grid_import_kwh
         self.state.stats.total_cost += total_cost
-        self.state.stats.total_load_shed_kwh += load_shed_kw * time_interval_hours
+
+        extra_forced_shed = 0.0
+        if config.DYNAMIC_SHED_CONFIG.get("enable_dynamic_shed", False):
+            bes_id = list(config.BESS_CONFIG.keys())[0]
+            bs = self.state.bess_state.get(bes_id)
+            soc = bs.soc if bs else 1.0
+            mode = self.state.current_shed_mode
+            if mode == "emergency" and soc < config.DYNAMIC_SHED_CONFIG["emergency_forced_shed_soc_threshold"]:
+                forced_gap = 0.0
+                shed_result, _ = self.state.compute_priority_load_shedding_dynamic(
+                    forced_gap, now, dispatch_id
+                )
+                if shed_result:
+                    forced_shed_total = sum(shed_result.values())
+                    extra_forced_shed = forced_shed_total
+                    load_shed_kw += forced_shed_total
+                    shed_breakdown = []
+                    for gid, kw in shed_result.items():
+                        gcfg = config.LOAD_GROUP_CONFIG[gid]
+                        shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
+                        if gid in group_shed_details:
+                            group_shed_details[gid]["shed_kw"] = round(
+                                group_shed_details[gid]["shed_kw"] + kw, 2
+                            )
+                        else:
+                            group_shed_details[gid] = {
+                                "group_id": gid,
+                                "name": gcfg["name"],
+                                "shed_kw": round(kw, 2),
+                                "shed_priority": gcfg["shed_priority"],
+                            }
+                    notes.append(
+                        f"[紧急保护] SOC低于{config.DYNAMIC_SHED_CONFIG['emergency_forced_shed_soc_threshold']*100:.0f}%，"
+                        f"强制切除三级群组: {', '.join(shed_breakdown)} (合计{forced_shed_total:.2f}kW)"
+                    )
+                    self.state.add_alert(
+                        "EMERGENCY_FORCED_SHED",
+                        f"紧急模式SOC保护，强制切除负荷: {', '.join(shed_breakdown)}",
+                        {"soc": soc, "shed_kw": forced_shed_total,
+                         "shed_by_group": shed_result, "threshold": config.DYNAMIC_SHED_CONFIG["emergency_forced_shed_soc_threshold"]}
+                    )
+                    audit_builder.add_branch(
+                        "紧急保护强制切负荷",
+                        True,
+                        f"SOC({soc*100:.1f}%)低于阈值({config.DYNAMIC_SHED_CONFIG['emergency_forced_shed_soc_threshold']*100:.0f}%)，"
+                        f"强制切除三级群组负荷{forced_shed_total:.2f}kW",
+                        {"soc": soc, "threshold": config.DYNAMIC_SHED_CONFIG["emergency_forced_shed_soc_threshold"],
+                         "shed_kw": forced_shed_total, "shed_by_group": shed_result}
+                    )
+
+        self.state.stats.total_load_shed_kwh += (load_shed_kw) * time_interval_hours
 
         self.state.finalize_group_state_after_dispatch()
         self.state.record_reliability_snapshot(now)

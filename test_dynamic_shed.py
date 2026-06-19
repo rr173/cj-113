@@ -289,7 +289,7 @@ class Test04_DynamicLoadShedding:
         assert shed.get("group2", 0) > 72
 
     def test_emergency_forced_shed_low_soc(self, state):
-        """紧急模式且SOC低于25%时强制全切三级"""
+        """紧急模式且SOC低于25%时强制全切三级（即使有缺口）"""
         now = datetime.now()
         _report_all_sources(state, pv1=0, pv2=0, wt1=0, now=now)
         _report_load_groups(state, g1=50, g2=120, g3=180, now=now)
@@ -301,6 +301,52 @@ class Test04_DynamicLoadShedding:
 
         gs3 = state.load_group_state["group3"]
         assert gs3["current_shed_kw"] == pytest.approx(180)
+
+    def test_emergency_forced_shed_without_gap(self, state):
+        """紧急模式且SOC低于25%时，即使无供电缺口也强制全切三级"""
+        now = datetime.now()
+        _report_all_sources(state, pv1=300, pv2=300, wt1=100, now=now)
+        _report_load_groups(state, g1=50, g2=120, g3=180, now=now)
+        state.bess_state["bes1"].soc = 0.2
+        state.current_shed_mode = "emergency"
+
+        gap = 0
+        shed, remaining = state.compute_priority_load_shedding_dynamic(gap, now, "TEST-GAPLESS-001")
+
+        gs3 = state.load_group_state["group3"]
+        assert gs3["current_shed_kw"] == pytest.approx(180)
+        assert "group3" in shed
+        assert shed["group3"] == pytest.approx(180)
+
+    def test_emergency_soc_above_threshold_no_forced(self, state):
+        """紧急模式但SOC高于25%时，无缺口就不强制切除"""
+        now = datetime.now()
+        _report_all_sources(state, pv1=300, pv2=300, wt1=100, now=now)
+        _report_load_groups(state, g1=50, g2=120, g3=180, now=now)
+        state.bess_state["bes1"].soc = 0.3
+        state.current_shed_mode = "emergency"
+
+        gap = 0
+        shed, remaining = state.compute_priority_load_shedding_dynamic(gap, now, "TEST-GAPLESS-002")
+
+        gs3 = state.load_group_state["group3"]
+        assert gs3["current_shed_kw"] == pytest.approx(0)
+        assert len(shed) == 0
+
+    def test_normal_mode_no_forced_shed(self, state):
+        """正常模式即使SOC很低也不强制切除"""
+        now = datetime.now()
+        _report_all_sources(state, pv1=300, pv2=300, wt1=100, now=now)
+        _report_load_groups(state, g1=50, g2=120, g3=180, now=now)
+        state.bess_state["bes1"].soc = 0.1
+        state.current_shed_mode = "normal"
+
+        gap = 0
+        shed, remaining = state.compute_priority_load_shedding_dynamic(gap, now, "TEST-GAPLESS-003")
+
+        gs3 = state.load_group_state["group3"]
+        assert gs3["current_shed_kw"] == pytest.approx(0)
+        assert len(shed) == 0
 
 
 class Test05_EmergencyRestore:
@@ -514,6 +560,51 @@ class Test08_FullDispatchIntegration:
         for gid in limits:
             assert limits[gid]["dynamic_max_shed_ratio"] >= 0
             assert limits[gid]["dynamic_max_shed_ratio"] <= 1
+
+    def test_dispatch_emergency_forced_shed_no_gap(self, engine, state):
+        """集成测试：调度流程中紧急模式+低SOC无缺口时也强制切三级"""
+        now = datetime(2026, 6, 19, 14, 0, 0)
+        _report_all_sources(state, pv1=200, pv2=200, wt1=100, now=now)
+        _report_load_groups(state, g1=50, g2=120, g3=180, now=now)
+        state.bess_state["bes1"].soc = 0.2
+        state.set_shed_mode_manual_lock(True, "emergency")
+
+        decision = engine.execute(now=now)
+
+        gs3 = state.load_group_state["group3"]
+        assert gs3["current_shed_kw"] == pytest.approx(180)
+        assert decision.load_shed_kw >= 179.99
+
+        has_forced_note = any("紧急保护" in note and "强制切除" in note for note in decision.notes)
+        assert has_forced_note
+
+    def test_dispatch_api_endpoints_exist(self, engine, state):
+        """集成测试：验证所有查询接口返回正常格式"""
+        now = datetime(2026, 6, 19, 14, 0, 0)
+        _report_all_sources(state, pv1=100, pv2=100, wt1=40, now=now)
+        _report_load_groups(state, g1=50, g2=120, g3=150, now=now)
+
+        engine.execute(now=now)
+
+        pressure_info = state.get_power_pressure_info()
+        assert "current_pressure_index" in pressure_info
+        assert "current_mode" in pressure_info
+        assert "manual_lock" in pressure_info
+
+        pressure_history = state.get_power_pressure_history(limit=10)
+        assert isinstance(pressure_history, list)
+
+        limits = state.get_dynamic_shed_limits()
+        assert len(limits) == 3
+        for gid in ["group1", "group2", "group3"]:
+            assert gid in limits
+
+        mode_history = state.get_shed_mode_history(limit=10)
+        assert isinstance(mode_history, list)
+
+        restore_status = state.get_emergency_restore_status()
+        assert "pending_restore" in restore_status
+        assert "total_extra_shed_kw" in restore_status
 
 
 if __name__ == "__main__":

@@ -1763,12 +1763,6 @@ class MicrogridState:
         if not config.DYNAMIC_SHED_CONFIG.get("enable_dynamic_shed", False):
             return self.compute_priority_load_shedding(gap_kw, now, dispatch_id)
 
-        if gap_kw <= 0:
-            for gid, gs in self.load_group_state.items():
-                reported = max(0.0, gs["reported_power_kw"])
-                gs["current_served_kw"] = max(0.0, reported - gs["current_shed_kw"])
-            return {}, 0.0
-
         mode = self.current_shed_mode
         bes_id = list(config.BESS_CONFIG.keys())[0]
         bs = self.bess_state.get(bes_id)
