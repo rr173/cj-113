@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field, asdict
 from copy import deepcopy
 
@@ -16,9 +16,38 @@ class SourceReport:
 
 
 @dataclass
+class LoadGroupReport:
+    group_id: str
+    actual_power_kw: float
+    timestamp: datetime
+
+
+@dataclass
 class LoadReport:
     load_kw: float
     timestamp: datetime
+    group_reports: Dict[str, LoadGroupReport] = field(default_factory=dict)
+
+
+@dataclass
+class LoadGroupShedEvent:
+    event_id: str
+    group_id: str
+    group_name: str
+    shed_power_kw: float
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    duration_minutes: float = 0.0
+    reason: str = ""
+    dispatch_id: Optional[str] = None
+
+
+@dataclass
+class LoadGroupReliabilitySnapshot:
+    timestamp: datetime
+    group_id: str
+    is_normal: bool
+    shed_power_kw: float
 
 
 @dataclass
@@ -36,6 +65,8 @@ class DispatchDecision:
     tariff_period: str
     grid_buy_price: float
     notes: List[str] = field(default_factory=list)
+    group_shed_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    group_restore_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -365,6 +396,32 @@ class MicrogridState:
         self._audit_counter: int = 0
         self._dispatch_counter: int = 0
 
+        self.load_group_reports: Dict[str, LoadGroupReport] = {}
+        self.load_group_state: Dict[str, Dict[str, Any]] = {}
+        for gid in config.LOAD_GROUP_CONFIG:
+            cfg = config.LOAD_GROUP_CONFIG[gid]
+            self.load_group_state[gid] = {
+                "group_id": gid,
+                "name": cfg["name"],
+                "description": cfg["description"],
+                "rated_power_kw": cfg["rated_power_kw"],
+                "max_shed_ratio": cfg["max_shed_ratio"],
+                "shed_priority": cfg["shed_priority"],
+                "restore_priority": cfg["restore_priority"],
+                "reported_power_kw": 0.0,
+                "current_served_kw": 0.0,
+                "current_shed_kw": 0.0,
+                "last_report_time": None,
+            }
+
+        self.load_group_shed_events: List[LoadGroupShedEvent] = []
+        self._load_group_event_counter: int = 0
+        self._active_shed_events: Dict[str, LoadGroupShedEvent] = {}
+
+        self.load_group_reliability_history: Dict[str, List[LoadGroupReliabilitySnapshot]] = {}
+        for gid in config.LOAD_GROUP_CONFIG:
+            self.load_group_reliability_history[gid] = []
+
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
             self.pv_reports[report.source_id] = report
@@ -383,6 +440,47 @@ class MicrogridState:
 
     def report_load(self, report: LoadReport):
         self.load_report = report
+        for gid, gr in report.group_reports.items():
+            if gid in self.load_group_state:
+                self.load_group_state[gid]["reported_power_kw"] = max(0.0, gr.actual_power_kw)
+                self.load_group_state[gid]["last_report_time"] = gr.timestamp
+                self.load_group_reports[gid] = gr
+
+    def report_load_group(self, group_id: str, actual_power_kw: float, timestamp: datetime = None):
+        if timestamp is None:
+            timestamp = datetime.now()
+        if group_id not in self.load_group_state:
+            raise ValueError(f"未知的负荷群组: {group_id}")
+
+        gr = LoadGroupReport(
+            group_id=group_id,
+            actual_power_kw=max(0.0, actual_power_kw),
+            timestamp=timestamp,
+        )
+        self.load_group_reports[group_id] = gr
+        self.load_group_state[group_id]["reported_power_kw"] = gr.actual_power_kw
+        self.load_group_state[group_id]["last_report_time"] = timestamp
+
+        total = self._compute_total_load_from_groups()
+        if self.load_report is None:
+            self.load_report = LoadReport(
+                load_kw=total,
+                timestamp=timestamp,
+                group_reports={group_id: gr},
+            )
+        else:
+            self.load_report.load_kw = total
+            self.load_report.timestamp = timestamp
+            self.load_report.group_reports[group_id] = gr
+
+    def _compute_total_load_from_groups(self) -> float:
+        total = 0.0
+        for gid, gs in self.load_group_state.items():
+            total += max(0.0, gs["reported_power_kw"])
+        return total
+
+    def all_groups_reported(self) -> bool:
+        return all(gid in self.load_group_reports for gid in config.LOAD_GROUP_CONFIG)
 
     def all_sources_reported(self) -> bool:
         pv_ok = all(sid in self.pv_reports for sid in config.PV_CONFIG)
@@ -1233,3 +1331,268 @@ class MicrogridState:
         anomalies = [log for log in self.audit_logs if log.has_anomaly()]
         anomalies = list(reversed(anomalies))
         return anomalies[:limit]
+
+    def compute_priority_load_shedding(self, gap_kw: float, now: datetime,
+                                       dispatch_id: str = None) -> Tuple[Dict[str, float], float]:
+        if gap_kw <= 0:
+            for gid, gs in self.load_group_state.items():
+                reported = max(0.0, gs["reported_power_kw"])
+                gs["current_served_kw"] = max(0.0, reported - gs["current_shed_kw"])
+            return {}, 0.0
+
+        remaining_gap = gap_kw
+        shed_by_group: Dict[str, float] = {}
+
+        for gid, gs in self.load_group_state.items():
+            reported = max(0.0, gs["reported_power_kw"])
+            gs["current_served_kw"] = max(0.0, reported - gs["current_shed_kw"])
+
+        sorted_by_shed = sorted(
+            self.load_group_state.items(),
+            key=lambda x: x[1]["shed_priority"],
+            reverse=True,
+        )
+
+        for gid, gs in sorted_by_shed:
+            if remaining_gap <= 0:
+                break
+
+            reported = max(0.0, gs["reported_power_kw"])
+            currently_served = reported - gs["current_shed_kw"]
+            max_shed_allowed = reported * gs["max_shed_ratio"]
+            additional_can_shed = max(0.0, max_shed_allowed - gs["current_shed_kw"])
+            can_serve_min = max(0.0, reported - max_shed_allowed)
+            additional_shed = min(remaining_gap, additional_can_shed, currently_served - can_serve_min)
+
+            if additional_shed > 0.01:
+                shed_by_group[gid] = additional_shed
+                remaining_gap -= additional_shed
+                new_total_shed = gs["current_shed_kw"] + additional_shed
+                gs["current_shed_kw"] = new_total_shed
+                gs["current_served_kw"] = max(0.0, reported - new_total_shed)
+
+                if gid not in self._active_shed_events or self._active_shed_events[gid].shed_power_kw <= 0:
+                    self._load_group_event_counter += 1
+                    event_id = f"SHED-{self._load_group_event_counter:06d}"
+                    event = LoadGroupShedEvent(
+                        event_id=event_id,
+                        group_id=gid,
+                        group_name=gs["name"],
+                        shed_power_kw=new_total_shed,
+                        started_at=now,
+                        reason=f"供电缺口{gap_kw:.2f}kW，按优先级切除负荷",
+                        dispatch_id=dispatch_id,
+                    )
+                    self.load_group_shed_events.append(event)
+                    self._active_shed_events[gid] = event
+                else:
+                    event = self._active_shed_events[gid]
+                    event.shed_power_kw = new_total_shed
+            elif gid in self._active_shed_events and self._active_shed_events[gid].shed_power_kw > 0:
+                event = self._active_shed_events[gid]
+                event.shed_power_kw = gs["current_shed_kw"]
+
+        total_shed = sum(shed_by_group.values())
+        return shed_by_group, remaining_gap
+
+    def restore_load_groups(self, surplus_kw: float, now: datetime,
+                            dispatch_id: str = None) -> Tuple[Dict[str, float], float]:
+        if surplus_kw <= 0:
+            return {}, 0.0
+
+        remaining_surplus = surplus_kw
+        restored_by_group: Dict[str, float] = {}
+
+        sorted_by_restore = sorted(
+            self.load_group_state.items(),
+            key=lambda x: x[1]["restore_priority"],
+        )
+
+        for gid, gs in sorted_by_restore:
+            if remaining_surplus <= 0:
+                break
+            if gs["current_shed_kw"] <= 0:
+                continue
+
+            restore_amount = min(remaining_surplus, gs["current_shed_kw"])
+            if restore_amount > 0.01:
+                restored_by_group[gid] = restore_amount
+                remaining_surplus -= restore_amount
+                new_shed = gs["current_shed_kw"] - restore_amount
+                gs["current_shed_kw"] = new_shed
+                reported = max(0.0, gs["reported_power_kw"])
+                gs["current_served_kw"] = reported - new_shed
+
+                if gid in self._active_shed_events:
+                    event = self._active_shed_events[gid]
+                    if new_shed <= 0.01:
+                        event.ended_at = now
+                        event.duration_minutes = (now - event.started_at).total_seconds() / 60.0
+                        del self._active_shed_events[gid]
+                    else:
+                        event.shed_power_kw = new_shed
+
+        total_restored = sum(restored_by_group.values())
+        return restored_by_group, remaining_surplus
+
+    def finalize_group_state_after_dispatch(self):
+        for gid, gs in self.load_group_state.items():
+            reported = max(0.0, gs["reported_power_kw"])
+            if gs["current_shed_kw"] > reported:
+                gs["current_shed_kw"] = reported
+            gs["current_served_kw"] = reported - gs["current_shed_kw"]
+
+    def record_reliability_snapshot(self, now: datetime):
+        for gid, gs in self.load_group_state.items():
+            snapshot = LoadGroupReliabilitySnapshot(
+                timestamp=now,
+                group_id=gid,
+                is_normal=gs["current_shed_kw"] <= 0.01,
+                shed_power_kw=gs["current_shed_kw"],
+            )
+            self.load_group_reliability_history[gid].append(snapshot)
+            if len(self.load_group_reliability_history[gid]) > 10000:
+                self.load_group_reliability_history[gid] = self.load_group_reliability_history[gid][-10000:]
+
+    def get_load_group_status(self, group_id: str = None) -> Dict[str, Any]:
+        result = {}
+        groups = [group_id] if group_id else list(self.load_group_state.keys())
+        for gid in groups:
+            if gid not in self.load_group_state:
+                continue
+            gs = self.load_group_state[gid]
+            reported = max(0.0, gs["reported_power_kw"])
+            shed = gs["current_shed_kw"]
+            if shed <= 0.01:
+                supply_status = "正常"
+            elif shed >= reported - 0.01 and reported > 0:
+                supply_status = "完全切除"
+            else:
+                supply_status = "部分切除"
+
+            max_shed_allowed = reported * gs["max_shed_ratio"]
+            result[gid] = {
+                "group_id": gid,
+                "name": gs["name"],
+                "description": gs["description"],
+                "rated_power_kw": gs["rated_power_kw"],
+                "reported_power_kw": round(reported, 2),
+                "max_shed_ratio": gs["max_shed_ratio"],
+                "max_shed_allowed_kw": round(max_shed_allowed, 2),
+                "shed_priority": gs["shed_priority"],
+                "restore_priority": gs["restore_priority"],
+                "current_served_kw": round(gs["current_served_kw"], 2),
+                "current_shed_kw": round(shed, 2),
+                "supply_status": supply_status,
+                "shed_ratio_of_reported": round(shed / reported, 4) if reported > 0 else 0,
+                "shed_ratio_of_allowed": round(shed / max_shed_allowed, 4) if max_shed_allowed > 0 else 0,
+                "last_report_time": gs["last_report_time"].isoformat() if gs["last_report_time"] else None,
+                "is_actively_shed": gid in self._active_shed_events,
+            }
+        if group_id:
+            return result.get(group_id, {})
+        return result
+
+    def update_load_group_config(self, group_id: str, rated_power_kw: float = None,
+                                  max_shed_ratio: float = None) -> bool:
+        if group_id not in self.load_group_state:
+            return False
+
+        gs = self.load_group_state[group_id]
+        if rated_power_kw is not None:
+            if rated_power_kw < 0:
+                return False
+            gs["rated_power_kw"] = float(rated_power_kw)
+            config.LOAD_GROUP_CONFIG[group_id]["rated_power_kw"] = float(rated_power_kw)
+
+        if max_shed_ratio is not None:
+            if not (0 <= max_shed_ratio <= 1):
+                return False
+            if group_id == "group1" and max_shed_ratio > 0:
+                return False
+            gs["max_shed_ratio"] = float(max_shed_ratio)
+            config.LOAD_GROUP_CONFIG[group_id]["max_shed_ratio"] = float(max_shed_ratio)
+
+        return True
+
+    def get_load_group_shed_history(self, group_id: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        if group_id:
+            events = [e for e in self.load_group_shed_events if e.group_id == group_id]
+        else:
+            events = list(self.load_group_shed_events)
+        events = events[-limit:]
+        result = []
+        for e in reversed(events):
+            result.append({
+                "event_id": e.event_id,
+                "group_id": e.group_id,
+                "group_name": e.group_name,
+                "shed_power_kw": round(e.shed_power_kw, 2),
+                "started_at": e.started_at.isoformat(),
+                "ended_at": e.ended_at.isoformat() if e.ended_at else None,
+                "duration_minutes": round(e.duration_minutes, 2) if e.ended_at else None,
+                "still_active": e.ended_at is None,
+                "reason": e.reason,
+                "dispatch_id": e.dispatch_id,
+            })
+        return result
+
+    def get_load_group_reliability_stats(self, group_id: str = None,
+                                          start_time: datetime = None,
+                                          end_time: datetime = None) -> Dict[str, Any]:
+        result = {}
+        groups = [group_id] if group_id else list(self.load_group_state.keys())
+
+        for gid in groups:
+            history = self.load_group_reliability_history.get(gid, [])
+            if start_time:
+                history = [h for h in history if h.timestamp >= start_time]
+            if end_time:
+                history = [h for h in history if h.timestamp <= end_time]
+
+            if not history:
+                result[gid] = {
+                    "group_id": gid,
+                    "name": self.load_group_state.get(gid, {}).get("name", gid),
+                    "total_snapshots": 0,
+                    "normal_snapshots": 0,
+                    "shed_snapshots": 0,
+                    "reliability_percent": None,
+                    "avg_shed_power_kw": 0,
+                    "max_shed_power_kw": 0,
+                    "time_window": {
+                        "start": start_time.isoformat() if start_time else None,
+                        "end": end_time.isoformat() if end_time else None,
+                    },
+                }
+                continue
+
+            total = len(history)
+            normal = sum(1 for h in history if h.is_normal)
+            shed_count = total - normal
+            reliability = normal / total * 100 if total > 0 else 0
+            avg_shed = sum(h.shed_power_kw for h in history) / total
+            max_shed = max(h.shed_power_kw for h in history)
+
+            result[gid] = {
+                "group_id": gid,
+                "name": self.load_group_state.get(gid, {}).get("name", gid),
+                "total_snapshots": total,
+                "normal_snapshots": normal,
+                "shed_snapshots": shed_count,
+                "reliability_percent": round(reliability, 2),
+                "avg_shed_power_kw": round(avg_shed, 2),
+                "max_shed_power_kw": round(max_shed, 2),
+                "time_window": {
+                    "start": history[0].timestamp.isoformat(),
+                    "end": history[-1].timestamp.isoformat(),
+                },
+            }
+
+        if group_id:
+            return result.get(group_id, {})
+        return result
+
+    def generate_load_group_event_id(self) -> str:
+        self._load_group_event_counter += 1
+        return f"SHED-{self._load_group_event_counter:06d}"

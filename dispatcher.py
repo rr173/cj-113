@@ -118,6 +118,11 @@ class DispatchEngine:
         arbitrage_discharge_revenue = 0.0
         load_grid_import_kwh = 0.0
 
+        group_shed_details: Dict[str, Dict[str, Any]] = {}
+        group_restore_details: Dict[str, Dict[str, Any]] = {}
+
+        prev_active_shed_count = sum(1 for g in self.state._active_shed_events.values() if g.shed_power_kw > 0.01)
+
         tariff_period = config.get_tariff_period(now.hour)
         diesel_gen_cost = config.DIESEL_CONFIG[list(config.DIESEL_CONFIG.keys())[0]]["generation_cost"]
         feed_in_price = config.FEED_IN_TARIFF
@@ -320,22 +325,61 @@ class DispatchEngine:
                     )
 
             if remaining_load > 0:
-                load_shed_kw = remaining_load
                 total_available = renewable_for_load + diesel_output[ds_id] + (grid_import_kw - bess_action[bes_id]["charge_kw"] + charge_from_renewable)
+                shed_result, unshed_gap = self.state.compute_priority_load_shedding(
+                    remaining_load, now, dispatch_id
+                )
+                total_shed_actual = sum(shed_result.values())
+                load_shed_kw = total_shed_actual + unshed_gap
+
+                shed_breakdown = []
+                for gid, kw in shed_result.items():
+                    gcfg = config.LOAD_GROUP_CONFIG[gid]
+                    shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
+                    group_shed_details[gid] = {
+                        "group_id": gid,
+                        "name": gcfg["name"],
+                        "shed_kw": round(kw, 2),
+                        "shed_priority": gcfg["shed_priority"],
+                    }
+                if unshed_gap > 0.01:
+                    shed_breakdown.append(f"无法继续切除缺口{unshed_gap:.2f}kW")
+
                 self.state.add_alert(
                     "LOAD_SHEDDING",
-                    f"负荷缺口 {load_shed_kw:.2f}kW，执行甩负荷",
-                    {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw}
+                    f"负荷缺口 {remaining_load:.2f}kW，按优先级甩负荷: {', '.join(shed_breakdown)}",
+                    {"load_kw": load_kw, "total_available_kw": total_available,
+                     "shed_kw": load_shed_kw, "shed_breakdown": shed_result,
+                     "unshed_gap_kw": round(unshed_gap, 2)}
                 )
-                notes.append(f"警告：甩负荷 {load_shed_kw:.2f}kW")
+                notes.append(f"警告：按优先级甩负荷 {load_shed_kw:.2f}kW ({', '.join(shed_breakdown)})")
                 audit_builder.add_branch(
                     "甩负荷决策",
                     True,
-                    f"供电能力不足，甩负荷{load_shed_kw:.2f}kW",
+                    f"供电能力不足，按优先级甩负荷{load_shed_kw:.2f}kW: {', '.join(shed_breakdown)}",
                     {"shed_kw": load_shed_kw, "total_available_kw": total_available,
-                     "load_kw": load_kw}
+                     "load_kw": load_kw, "shed_by_group": shed_result,
+                     "unshed_gap_kw": round(unshed_gap, 2)}
                 )
             else:
+                if prev_active_shed_count > 0:
+                    surplus_for_restore = -remaining_load
+                    if surplus_for_restore > 0:
+                        restored, leftover = self.state.restore_load_groups(
+                            surplus_for_restore, now, dispatch_id
+                        )
+                        if restored:
+                            restore_breakdown = []
+                            for gid, kw in restored.items():
+                                gcfg = config.LOAD_GROUP_CONFIG[gid]
+                                restore_breakdown.append(f"{gcfg['name']}恢复{kw:.2f}kW")
+                                group_restore_details[gid] = {
+                                    "group_id": gid,
+                                    "name": gcfg["name"],
+                                    "restored_kw": round(kw, 2),
+                                    "restore_priority": gcfg["restore_priority"],
+                                }
+                            notes.append(f"[供电恢复] {', '.join(restore_breakdown)}")
                 audit_builder.add_branch(
                     "甩负荷决策",
                     False,
@@ -444,22 +488,67 @@ class DispatchEngine:
                             )
 
                 if remaining_load > 0:
-                    load_shed_kw = remaining_load
                     total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
+                    shed_result, unshed_gap = self.state.compute_priority_load_shedding(
+                        remaining_load, now, dispatch_id
+                    )
+                    total_shed_actual = sum(shed_result.values())
+                    load_shed_kw = total_shed_actual + unshed_gap
+
+                    shed_breakdown = []
+                    for gid, kw in shed_result.items():
+                        gcfg = config.LOAD_GROUP_CONFIG[gid]
+                        shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
+                        if gid not in group_shed_details:
+                            group_shed_details[gid] = {
+                                "group_id": gid,
+                                "name": gcfg["name"],
+                                "shed_kw": round(kw, 2),
+                                "shed_priority": gcfg["shed_priority"],
+                            }
+                        else:
+                            group_shed_details[gid]["shed_kw"] = round(group_shed_details[gid]["shed_kw"] + kw, 2)
+                    if unshed_gap > 0.01:
+                        shed_breakdown.append(f"无法继续切除缺口{unshed_gap:.2f}kW")
+
                     self.state.add_alert(
                         "LOAD_SHEDDING",
-                        f"负荷缺口 {load_shed_kw:.2f}kW，执行甩负荷",
-                        {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw}
+                        f"负荷缺口 {remaining_load:.2f}kW，按优先级甩负荷: {', '.join(shed_breakdown)}",
+                        {"load_kw": load_kw, "total_available_kw": total_available,
+                         "shed_kw": load_shed_kw, "shed_breakdown": shed_result,
+                         "unshed_gap_kw": round(unshed_gap, 2)}
                     )
-                    notes.append(f"警告：甩负荷 {load_shed_kw:.2f}kW")
+                    notes.append(f"警告：按优先级甩负荷 {load_shed_kw:.2f}kW ({', '.join(shed_breakdown)})")
                     audit_builder.add_branch(
                         "甩负荷决策",
                         True,
-                        f"供电能力不足，甩负荷{load_shed_kw:.2f}kW",
+                        f"供电能力不足，按优先级甩负荷{load_shed_kw:.2f}kW: {', '.join(shed_breakdown)}",
                         {"shed_kw": load_shed_kw, "total_available_kw": total_available,
-                         "load_kw": load_kw}
+                         "load_kw": load_kw, "shed_by_group": shed_result,
+                         "unshed_gap_kw": round(unshed_gap, 2)}
                     )
                 else:
+                    if prev_active_shed_count > 0 and remaining_load < 0:
+                        surplus_for_restore = -remaining_load
+                        if surplus_for_restore > 0:
+                            restored, leftover = self.state.restore_load_groups(
+                                surplus_for_restore, now, dispatch_id
+                            )
+                            if restored:
+                                restore_breakdown = []
+                                for gid, kw in restored.items():
+                                    gcfg = config.LOAD_GROUP_CONFIG[gid]
+                                    restore_breakdown.append(f"{gcfg['name']}恢复{kw:.2f}kW")
+                                    if gid not in group_restore_details:
+                                        group_restore_details[gid] = {
+                                            "group_id": gid,
+                                            "name": gcfg["name"],
+                                            "restored_kw": round(kw, 2),
+                                            "restore_priority": gcfg["restore_priority"],
+                                        }
+                                    else:
+                                        group_restore_details[gid]["restored_kw"] = round(group_restore_details[gid]["restored_kw"] + kw, 2)
+                                notes.append(f"[供电恢复] {', '.join(restore_breakdown)}")
                     audit_builder.add_branch(
                         "甩负荷决策",
                         False,
@@ -499,6 +588,27 @@ class DispatchEngine:
                     revenue = grid_export_kw * time_interval_hours * feed_in_price
                     total_cost -= revenue
                     notes.append(f"余电上网 {grid_export_kw:.2f}kW (收入 {revenue:.2f}元)")
+
+                total_surplus_for_restore = (-remaining_load)
+                if prev_active_shed_count > 0 and total_surplus_for_restore > 0:
+                    restored, leftover = self.state.restore_load_groups(
+                        total_surplus_for_restore, now, dispatch_id
+                    )
+                    if restored:
+                        restore_breakdown = []
+                        for gid, kw in restored.items():
+                            gcfg = config.LOAD_GROUP_CONFIG[gid]
+                            restore_breakdown.append(f"{gcfg['name']}恢复{kw:.2f}kW")
+                            if gid not in group_restore_details:
+                                group_restore_details[gid] = {
+                                    "group_id": gid,
+                                    "name": gcfg["name"],
+                                    "restored_kw": round(kw, 2),
+                                    "restore_priority": gcfg["restore_priority"],
+                                }
+                            else:
+                                group_restore_details[gid]["restored_kw"] = round(group_restore_details[gid]["restored_kw"] + kw, 2)
+                        notes.append(f"[供电恢复] {', '.join(restore_breakdown)}")
 
                 audit_builder.add_branch(
                     "电池放电决策",
@@ -642,22 +752,67 @@ class DispatchEngine:
                             )
 
                     if remaining_load > 0:
-                        load_shed_kw = remaining_load
                         total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
+                        shed_result, unshed_gap = self.state.compute_priority_load_shedding(
+                            remaining_load, now, dispatch_id
+                        )
+                        total_shed_actual = sum(shed_result.values())
+                        load_shed_kw = total_shed_actual + unshed_gap
+
+                        shed_breakdown = []
+                        for gid, kw in shed_result.items():
+                            gcfg = config.LOAD_GROUP_CONFIG[gid]
+                            shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
+                            if gid not in group_shed_details:
+                                group_shed_details[gid] = {
+                                    "group_id": gid,
+                                    "name": gcfg["name"],
+                                    "shed_kw": round(kw, 2),
+                                    "shed_priority": gcfg["shed_priority"],
+                                }
+                            else:
+                                group_shed_details[gid]["shed_kw"] = round(group_shed_details[gid]["shed_kw"] + kw, 2)
+                        if unshed_gap > 0.01:
+                            shed_breakdown.append(f"无法继续切除缺口{unshed_gap:.2f}kW")
+
                         self.state.add_alert(
                             "LOAD_SHEDDING",
-                            f"负荷缺口 {load_shed_kw:.2f}kW，执行甩负荷",
-                            {"load_kw": load_kw, "total_available_kw": total_available, "shed_kw": load_shed_kw}
+                            f"负荷缺口 {remaining_load:.2f}kW，按优先级甩负荷: {', '.join(shed_breakdown)}",
+                            {"load_kw": load_kw, "total_available_kw": total_available,
+                             "shed_kw": load_shed_kw, "shed_breakdown": shed_result,
+                             "unshed_gap_kw": round(unshed_gap, 2)}
                         )
-                        notes.append(f"警告：甩负荷 {load_shed_kw:.2f}kW (本地所有可用源出力不足)")
+                        notes.append(f"警告：按优先级甩负荷 {load_shed_kw:.2f}kW ({', '.join(shed_breakdown)})")
                         audit_builder.add_branch(
                             "甩负荷决策",
                             True,
-                            f"所有可用源仍无法覆盖负荷，甩负荷{load_shed_kw:.2f}kW",
+                            f"所有可用源仍无法覆盖负荷，按优先级甩负荷{load_shed_kw:.2f}kW: {', '.join(shed_breakdown)}",
                             {"shed_kw": load_shed_kw, "total_available_kw": total_available,
-                             "load_kw": load_kw}
+                             "load_kw": load_kw, "shed_by_group": shed_result,
+                             "unshed_gap_kw": round(unshed_gap, 2)}
                         )
                     else:
+                        if prev_active_shed_count > 0 and remaining_load < 0:
+                            surplus_for_restore = -remaining_load
+                            if surplus_for_restore > 0:
+                                restored, leftover = self.state.restore_load_groups(
+                                    surplus_for_restore, now, dispatch_id
+                                )
+                                if restored:
+                                    restore_breakdown = []
+                                    for gid, kw in restored.items():
+                                        gcfg = config.LOAD_GROUP_CONFIG[gid]
+                                        restore_breakdown.append(f"{gcfg['name']}恢复{kw:.2f}kW")
+                                        if gid not in group_restore_details:
+                                            group_restore_details[gid] = {
+                                                "group_id": gid,
+                                                "name": gcfg["name"],
+                                                "restored_kw": round(kw, 2),
+                                                "restore_priority": gcfg["restore_priority"],
+                                            }
+                                        else:
+                                            group_restore_details[gid]["restored_kw"] = round(group_restore_details[gid]["restored_kw"] + kw, 2)
+                                    notes.append(f"[供电恢复] {', '.join(restore_breakdown)}")
                         audit_builder.add_branch(
                             "甩负荷决策",
                             False,
@@ -713,6 +868,27 @@ class DispatchEngine:
                     revenue = grid_export_kw * time_interval_hours * feed_in_price
                     total_cost -= revenue
                     notes.append(f"余电上网 {grid_export_kw:.2f}kW (收入 {revenue:.2f}元)")
+
+                total_surplus_for_restore = (-remaining_load)
+                if prev_active_shed_count > 0 and total_surplus_for_restore > 0:
+                    restored, leftover = self.state.restore_load_groups(
+                        total_surplus_for_restore, now, dispatch_id
+                    )
+                    if restored:
+                        restore_breakdown = []
+                        for gid, kw in restored.items():
+                            gcfg = config.LOAD_GROUP_CONFIG[gid]
+                            restore_breakdown.append(f"{gcfg['name']}恢复{kw:.2f}kW")
+                            if gid not in group_restore_details:
+                                group_restore_details[gid] = {
+                                    "group_id": gid,
+                                    "name": gcfg["name"],
+                                    "restored_kw": round(kw, 2),
+                                    "restore_priority": gcfg["restore_priority"],
+                                }
+                            else:
+                                group_restore_details[gid]["restored_kw"] = round(group_restore_details[gid]["restored_kw"] + kw, 2)
+                        notes.append(f"[供电恢复] {', '.join(restore_breakdown)}")
 
                 audit_builder.add_branch(
                     "电池放电决策",
@@ -834,6 +1010,9 @@ class DispatchEngine:
         self.state.stats.total_cost += total_cost
         self.state.stats.total_load_shed_kwh += load_shed_kw * time_interval_hours
 
+        self.state.finalize_group_state_after_dispatch()
+        self.state.record_reliability_snapshot(now)
+
         load_served = load_kw - load_shed_kw
 
         decision = DispatchDecision(
@@ -850,6 +1029,8 @@ class DispatchEngine:
             tariff_period=tariff_period,
             grid_buy_price=grid_buy_price,
             notes=notes,
+            group_shed_details=group_shed_details,
+            group_restore_details=group_restore_details,
         )
 
         if self.dr_manager:

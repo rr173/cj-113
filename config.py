@@ -66,6 +66,33 @@ FEED_IN_TARIFF = 0.3
 
 DEFAULT_DISPATCH_INTERVAL_MINUTES = 1
 
+LOAD_GROUP_CONFIG = {
+    "group1": {
+        "name": "一级(关键负荷)",
+        "description": "消防系统、安防监控、数据中心UPS",
+        "rated_power_kw": 50.0,
+        "max_shed_ratio": 0.0,
+        "shed_priority": 1,
+        "restore_priority": 1,
+    },
+    "group2": {
+        "name": "二级(重要负荷)",
+        "description": "办公照明、电梯、通风",
+        "rated_power_kw": 120.0,
+        "max_shed_ratio": 0.6,
+        "shed_priority": 2,
+        "restore_priority": 2,
+    },
+    "group3": {
+        "name": "三级(一般负荷)",
+        "description": "空调、充电桩、景观照明",
+        "rated_power_kw": 180.0,
+        "max_shed_ratio": 1.0,
+        "shed_priority": 3,
+        "restore_priority": 3,
+    },
+}
+
 
 def get_tariff_period(current_hour: int) -> str:
     for period, info in GRID_TARIFF.items():

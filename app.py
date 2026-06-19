@@ -49,6 +49,8 @@ def _decision_to_dict(d):
         "tariff_period": d.tariff_period,
         "grid_buy_price": d.grid_buy_price,
         "notes": d.notes,
+        "group_shed_details": d.group_shed_details,
+        "group_restore_details": d.group_restore_details,
     }
 
 
@@ -403,6 +405,8 @@ def _get_awaiting():
     for sid in config.WT_CONFIG:
         result[f"wt:{sid}"] = sid in state.wt_reports
     result["load"] = state.load_report is not None
+    for gid in config.LOAD_GROUP_CONFIG:
+        result[f"load_group:{gid}"] = gid in state.load_group_reports
     return result
 
 
@@ -570,6 +574,270 @@ def get_load_status():
         },
         "total_renewable_kw": state.get_total_renewable_kw(),
         "query_time": now.isoformat(),
+    })
+
+
+@app.route("/api/load/group/report", methods=["POST"])
+def report_load_group():
+    """
+    按群组分别上报负荷实际功率
+    请求体: {
+        "group_id": "group1" | "group2" | "group3",
+        "actual_power_kw": 45.2,
+        "auto_dispatch": true (可选，默认true)
+    }
+    """
+    data = request.get_json(force=True)
+    required = ["group_id", "actual_power_kw"]
+    for f in required:
+        if f not in data:
+            return jsonify({"error": f"缺少必填字段: {f}"}), 400
+
+    group_id = data["group_id"]
+    valid_groups = set(config.LOAD_GROUP_CONFIG.keys())
+    if group_id not in valid_groups:
+        return jsonify({"error": f"group_id 必须是 {valid_groups} 之一"}), 400
+
+    try:
+        state.report_load_group(group_id, float(data["actual_power_kw"]))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    try_dispatch = data.get("auto_dispatch", True)
+    if try_dispatch and state.all_sources_reported():
+        decision = engine.execute()
+        return jsonify({
+            "status": "ok",
+            "message": f"群组[{group_id}]负荷数据已接收，已执行调度决策",
+            "group_report": {
+                "group_id": group_id,
+                "reported_power_kw": state.load_group_state[group_id]["reported_power_kw"],
+                "timestamp": state.load_group_state[group_id]["last_report_time"].isoformat(),
+            },
+            "dispatch_decision": _decision_to_dict(decision),
+            "group_status": state.get_load_group_status(group_id),
+        })
+
+    return jsonify({
+        "status": "ok",
+        "message": f"群组[{group_id}]负荷数据已接收，等待其它源/群组上报后执行调度",
+        "group_report": {
+            "group_id": group_id,
+            "reported_power_kw": state.load_group_state[group_id]["reported_power_kw"],
+            "timestamp": state.load_group_state[group_id]["last_report_time"].isoformat() if state.load_group_state[group_id]["last_report_time"] else None,
+        },
+        "awaiting": _get_awaiting(),
+        "all_groups_reported": state.all_groups_reported(),
+    })
+
+
+@app.route("/api/load/groups/report", methods=["POST"])
+def report_all_load_groups():
+    """
+    批量上报所有群组的负荷功率
+    请求体: {
+        "groups": [
+            {"group_id": "group1", "actual_power_kw": 48.0},
+            {"group_id": "group2", "actual_power_kw": 115.0},
+            {"group_id": "group3", "actual_power_kw": 170.0}
+        ],
+        "auto_dispatch": true (可选，默认true)
+    }
+    """
+    data = request.get_json(force=True)
+    if "groups" not in data or not isinstance(data["groups"], list):
+        return jsonify({"error": "缺少必填字段: groups (数组形式)"}), 400
+
+    valid_groups = set(config.LOAD_GROUP_CONFIG.keys())
+    timestamp = datetime.now()
+    reported = []
+    errors = []
+
+    from models import LoadGroupReport, LoadReport
+    group_reports = {}
+    total_load = 0.0
+
+    for item in data["groups"]:
+        gid = item.get("group_id")
+        kw = item.get("actual_power_kw")
+        if gid not in valid_groups:
+            errors.append(f"无效的group_id: {gid}")
+            continue
+        if kw is None:
+            errors.append(f"群组{gid}缺少actual_power_kw")
+            continue
+        kw_f = max(0.0, float(kw))
+        gr = LoadGroupReport(group_id=gid, actual_power_kw=kw_f, timestamp=timestamp)
+        group_reports[gid] = gr
+        total_load += kw_f
+        reported.append(gid)
+        state.load_group_reports[gid] = gr
+        gs = state.load_group_state[gid]
+        gs["reported_power_kw"] = kw_f
+        gs["last_report_time"] = timestamp
+
+    if errors:
+        return jsonify({"error": "; ".join(errors)}), 400
+
+    full_report = LoadReport(load_kw=total_load, timestamp=timestamp, group_reports=group_reports)
+    state.report_load(full_report)
+
+    try_dispatch = data.get("auto_dispatch", True)
+    if try_dispatch and state.all_sources_reported():
+        decision = engine.execute()
+        return jsonify({
+            "status": "ok",
+            "message": "所有群组负荷数据已接收，已执行调度决策",
+            "reported_groups": reported,
+            "total_load_kw": round(total_load, 2),
+            "dispatch_decision": _decision_to_dict(decision),
+            "all_groups_status": state.get_load_group_status(),
+        })
+
+    return jsonify({
+        "status": "ok",
+        "message": f"已上报{len(reported)}个群组，总负荷{total_load:.2f}kW，等待其它源上报后执行调度",
+        "reported_groups": reported,
+        "total_load_kw": round(total_load, 2),
+        "awaiting": _get_awaiting(),
+    })
+
+
+@app.route("/api/load/groups/status", methods=["GET"])
+def get_load_groups_status():
+    """
+    查询各群组当前状态
+    参数: group_id (可选，指定单个群组)
+    """
+    group_id = request.args.get("group_id")
+    if group_id and group_id not in config.LOAD_GROUP_CONFIG:
+        return jsonify({"error": f"未找到负荷群组: {group_id}"}), 404
+
+    result = state.get_load_group_status(group_id)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "group_id": group_id,
+        "groups": result,
+    })
+
+
+@app.route("/api/load/groups/config", methods=["PUT"])
+def update_load_group_config():
+    """
+    修改群组配置（额定功率、最大切除比例），修改后立刻影响下次调度决策
+    请求体: {
+        "group_id": "group2",
+        "rated_power_kw": 150.0, (可选)
+        "max_shed_ratio": 0.7 (可选，group1不允许>0)
+    }
+    """
+    data = request.get_json(force=True)
+    if "group_id" not in data:
+        return jsonify({"error": "缺少必填字段: group_id"}), 400
+
+    group_id = data["group_id"]
+    if group_id not in config.LOAD_GROUP_CONFIG:
+        return jsonify({"error": f"未找到负荷群组: {group_id}"}), 404
+
+    rated_power = data.get("rated_power_kw")
+    max_shed_ratio = data.get("max_shed_ratio")
+    updated_fields = {}
+
+    if rated_power is not None:
+        rated_power = float(rated_power)
+        if rated_power < 0:
+            return jsonify({"error": "rated_power_kw 不能为负"}), 400
+        updated_fields["rated_power_kw"] = rated_power
+
+    if max_shed_ratio is not None:
+        max_shed_ratio = float(max_shed_ratio)
+        if not (0 <= max_shed_ratio <= 1):
+            return jsonify({"error": "max_shed_ratio 必须在 [0, 1] 区间内"}), 400
+        if group_id == "group1" and max_shed_ratio > 0:
+            return jsonify({"error": "一级(关键)负荷不允许切除，max_shed_ratio必须为0"}), 400
+        updated_fields["max_shed_ratio"] = max_shed_ratio
+
+    if not updated_fields:
+        return jsonify({"error": "未提供有效的配置修改(rated_power_kw / max_shed_ratio)"}), 400
+
+    success = state.update_load_group_config(
+        group_id,
+        rated_power_kw=updated_fields.get("rated_power_kw"),
+        max_shed_ratio=updated_fields.get("max_shed_ratio"),
+    )
+    if not success:
+        return jsonify({"error": "配置更新失败"}), 500
+
+    return jsonify({
+        "status": "ok",
+        "message": "群组配置已更新，立即生效（影响下次调度决策）",
+        "group_id": group_id,
+        "updated": updated_fields,
+        "current_config": {
+            "rated_power_kw": state.load_group_state[group_id]["rated_power_kw"],
+            "max_shed_ratio": state.load_group_state[group_id]["max_shed_ratio"],
+            "name": state.load_group_state[group_id]["name"],
+        },
+    })
+
+
+@app.route("/api/load/groups/shed-history", methods=["GET"])
+def get_load_group_shed_history():
+    """
+    查询历史切除事件
+    参数:
+      - group_id: 可选，指定群组
+      - limit: 可选，返回条数上限(默认100)
+    """
+    group_id = request.args.get("group_id")
+    if group_id and group_id not in config.LOAD_GROUP_CONFIG:
+        return jsonify({"error": f"未找到负荷群组: {group_id}"}), 404
+    try:
+        limit = int(request.args.get("limit", 100))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+
+    events = state.get_load_group_shed_history(group_id, limit)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "group_id": group_id,
+        "total_events": len(state.load_group_shed_events),
+        "returned": len(events),
+        "active_shed_count": len([e for e in state.load_group_shed_events if e.ended_at is None]),
+        "events": events,
+    })
+
+
+@app.route("/api/load/groups/reliability", methods=["GET"])
+def get_load_group_reliability():
+    """
+    查询供电可靠性统计（各群组的供电保障率=正常供电时间/总时间）
+    参数:
+      - group_id: 可选，指定群组
+      - start_time: 可选，统计窗口开始(ISO格式)
+      - end_time: 可选，统计窗口结束(ISO格式)
+    """
+    group_id = request.args.get("group_id")
+    if group_id and group_id not in config.LOAD_GROUP_CONFIG:
+        return jsonify({"error": f"未找到负荷群组: {group_id}"}), 404
+
+    start_time_str = request.args.get("start_time")
+    end_time_str = request.args.get("end_time")
+    start_time = datetime.fromisoformat(start_time_str) if start_time_str else None
+    end_time = datetime.fromisoformat(end_time_str) if end_time_str else None
+
+    stats = state.get_load_group_reliability_stats(group_id, start_time, end_time)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "group_id": group_id,
+        "time_window": {
+            "start": start_time_str,
+            "end": end_time_str,
+        },
+        "reliability_stats": stats,
     })
 
 
@@ -947,6 +1215,7 @@ def get_all_config():
                 for p in ["valley", "flat", "peak"]
             },
             "feed_in_tariff": config.FEED_IN_TARIFF,
+            "load_groups": config.LOAD_GROUP_CONFIG,
         }
     })
 
@@ -964,6 +1233,12 @@ def health_check():
         "alert_count": len(state.alerts),
         "backup_plan_count": len(state.backup_plans),
         "fault_event_count": len(state.fault_events),
+        "load_groups": {
+            "total_groups": len(config.LOAD_GROUP_CONFIG),
+            "active_shed_events": len([e for e in state.load_group_shed_events if e.ended_at is None]),
+            "total_shed_events": len(state.load_group_shed_events),
+            "all_groups_reported": state.all_groups_reported(),
+        },
     })
 
 
@@ -980,7 +1255,13 @@ def server_error(e):
 def _list_endpoints():
     return [
         "POST /api/source/report - 发电源出力上报",
-        "POST /api/load/report - 负荷数据上报",
+        "POST /api/load/report - 负荷数据上报（整体）",
+        "POST /api/load/group/report - 单群组负荷上报",
+        "POST /api/load/groups/report - 批量多群组负荷上报",
+        "GET /api/load/groups/status - 查询各群组当前状态",
+        "PUT /api/load/groups/config - 修改群组配置(额定功率/最大切除比例)",
+        "GET /api/load/groups/shed-history - 查询历史切除事件",
+        "GET /api/load/groups/reliability - 查询供电可靠性统计",
         "POST /api/dispatch/trigger - 手动触发调度",
         "GET /api/status/sources - 发电源状态",
         "GET /api/status/bess - 电池状态",
