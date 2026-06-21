@@ -1,7 +1,8 @@
 from datetime import datetime
 from typing import Dict, Any, Tuple, Optional
+from copy import deepcopy
 import config
-from models import MicrogridState, DispatchDecision, AuditLog
+from models import MicrogridState, DispatchDecision, AuditLog, StrategyParams
 from demand_response import DemandResponseManager
 from price_forecast import PriceForecastManager
 from audit import AuditBuilder, AnomalyDetector, CostAttributionAnalyzer
@@ -9,11 +10,15 @@ from audit import AuditBuilder, AnomalyDetector, CostAttributionAnalyzer
 
 class DispatchEngine:
     def __init__(self, state: MicrogridState, dr_manager: Optional[DemandResponseManager] = None,
-                 price_forecast_manager: Optional[PriceForecastManager] = None):
+                 price_forecast_manager: Optional[PriceForecastManager] = None,
+                 strategy_params: Optional[StrategyParams] = None):
         self.state = state
         self.dr_manager = dr_manager
         self.price_forecast_manager = price_forecast_manager
         self.anomaly_detector = AnomalyDetector(state)
+        if strategy_params is None:
+            strategy_params = StrategyParams()
+        self.strategy_params = strategy_params
 
     def _get_time_interval_hours(self, now: datetime) -> float:
         if self.state.last_dispatch_time is None:
@@ -36,6 +41,13 @@ class DispatchEngine:
             if self.state.load_report is None:
                 missing.append("load")
             raise ValueError(f"缺少上报数据: {', '.join(missing)}")
+
+        ds_manager = self.state.dual_strategy_manager
+        dual_enabled = ds_manager.enable
+        shadow_state_copy = None
+        if dual_enabled:
+            self.strategy_params = ds_manager.main_strategy
+            shadow_state_copy = deepcopy(self.state)
 
         dispatch_id = self.state.generate_dispatch_id()
         audit_builder = AuditBuilder(self.state, dispatch_id, now)
@@ -508,42 +520,63 @@ class DispatchEngine:
                     )
 
             if remaining_load > 0:
-                total_available = renewable_for_load + diesel_output[ds_id] + (grid_import_kw - bess_action[bes_id]["charge_kw"] + charge_from_renewable)
-                shed_result, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
-                    remaining_load, now, dispatch_id
-                )
-                total_shed_actual = sum(shed_result.values())
-                load_shed_kw = total_shed_actual + unshed_gap
+                shed_threshold = self.strategy_params.shed_trigger_threshold_ratio
+                gap_ratio = remaining_load / load_kw if load_kw > 0 else 1.0
+                if gap_ratio <= shed_threshold and shed_threshold > 0:
+                    grid_fill = remaining_load
+                    grid_fill_cost = grid_fill * time_interval_hours * grid_buy_price
+                    total_cost += grid_fill_cost
+                    grid_import_kw += grid_fill
+                    load_grid_import_kwh += grid_fill * time_interval_hours
+                    remaining_load = 0
+                    notes.append(f"[甩负荷容忍带] 缺口占比{gap_ratio*100:.1f}% ≤ 阈值{shed_threshold*100:.0f}%，强制购电填补{grid_fill:.2f}kW (成本{grid_fill_cost:.4f}元)")
+                    audit_builder.add_branch(
+                        "甩负荷决策",
+                        False,
+                        f"缺口占比{gap_ratio*100:.1f}%低于阈值{shed_threshold*100:.0f}%，容忍带内强制购电填补",
+                        {"gap_ratio": gap_ratio, "threshold": shed_threshold, "grid_fill_kw": grid_fill, "reason": "shed_tolerance_band"}
+                    )
+                    shed_result = {}
+                    unshed_gap = 0.0
+                    total_shed_actual = 0
+                    load_shed_kw = 0.0
+                else:
+                    total_available = renewable_for_load + diesel_output[ds_id] + (grid_import_kw - bess_action[bes_id]["charge_kw"] + charge_from_renewable)
+                    shed_result, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
+                        remaining_load, now, dispatch_id
+                    )
+                    total_shed_actual = sum(shed_result.values())
+                    load_shed_kw = total_shed_actual + unshed_gap
 
-                shed_breakdown = []
-                for gid, kw in shed_result.items():
-                    gcfg = config.LOAD_GROUP_CONFIG[gid]
-                    shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
-                    group_shed_details[gid] = {
-                        "group_id": gid,
-                        "name": gcfg["name"],
-                        "shed_kw": round(kw, 2),
-                        "shed_priority": gcfg["shed_priority"],
-                    }
-                if unshed_gap > 0.01:
-                    shed_breakdown.append(f"无法继续切除缺口{unshed_gap:.2f}kW")
+                    shed_breakdown = []
+                    for gid, kw in shed_result.items():
+                        gcfg = config.LOAD_GROUP_CONFIG[gid]
+                        shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
+                        group_shed_details[gid] = {
+                            "group_id": gid,
+                            "name": gcfg["name"],
+                            "shed_kw": round(kw, 2),
+                            "shed_priority": gcfg["shed_priority"],
+                        }
+                    if unshed_gap > 0.01:
+                        shed_breakdown.append(f"无法继续切除缺口{unshed_gap:.2f}kW")
 
-                self.state.add_alert(
-                    "LOAD_SHEDDING",
-                    f"负荷缺口 {remaining_load:.2f}kW，按优先级甩负荷: {', '.join(shed_breakdown)}",
-                    {"load_kw": load_kw, "total_available_kw": total_available,
-                     "shed_kw": load_shed_kw, "shed_breakdown": shed_result,
-                     "unshed_gap_kw": round(unshed_gap, 2)}
-                )
-                notes.append(f"警告：按优先级甩负荷 {load_shed_kw:.2f}kW ({', '.join(shed_breakdown)})")
-                audit_builder.add_branch(
-                    "甩负荷决策",
-                    True,
-                    f"供电能力不足，按优先级甩负荷{load_shed_kw:.2f}kW: {', '.join(shed_breakdown)}",
-                    {"shed_kw": load_shed_kw, "total_available_kw": total_available,
-                     "load_kw": load_kw, "shed_by_group": shed_result,
-                     "unshed_gap_kw": round(unshed_gap, 2)}
-                )
+                    self.state.add_alert(
+                        "LOAD_SHEDDING",
+                        f"负荷缺口 {remaining_load:.2f}kW，按优先级甩负荷: {', '.join(shed_breakdown)}",
+                        {"load_kw": load_kw, "total_available_kw": total_available,
+                         "shed_kw": load_shed_kw, "shed_breakdown": shed_result,
+                         "unshed_gap_kw": round(unshed_gap, 2)}
+                    )
+                    notes.append(f"警告：按优先级甩负荷 {load_shed_kw:.2f}kW ({', '.join(shed_breakdown)})")
+                    audit_builder.add_branch(
+                        "甩负荷决策",
+                        True,
+                        f"供电能力不足，按优先级甩负荷{load_shed_kw:.2f}kW: {', '.join(shed_breakdown)}",
+                        {"shed_kw": load_shed_kw, "total_available_kw": total_available,
+                         "load_kw": load_kw, "shed_by_group": shed_result,
+                         "unshed_gap_kw": round(unshed_gap, 2)}
+                    )
             else:
                 if prev_active_shed_count > 0:
                     surplus_for_restore = -remaining_load
@@ -574,8 +607,9 @@ class DispatchEngine:
                 cfg_b = config.BESS_CONFIG[bes_id]
                 base_max_discharge = self.state.get_bess_max_discharge(bes_id, time_interval_hours)
                 max_discharge = base_max_discharge
+                aggressiveness = self.strategy_params.battery_discharge_aggressiveness
 
-                discharge_kw = min(remaining_load, max_discharge)
+                discharge_kw = min(remaining_load * aggressiveness, max_discharge)
                 if discharge_kw > 0:
                     bess_action[bes_id]["discharge_kw"] = discharge_kw
                     remaining_load -= discharge_kw
@@ -606,7 +640,11 @@ class DispatchEngine:
                     )
 
                 if remaining_load > 0:
-                    use_grid = grid_buy_price < diesel_gen_cost
+                    tol_price = self.strategy_params.purchase_tolerance_price
+                    if tol_price is not None and grid_buy_price < tol_price:
+                        use_grid = True
+                    else:
+                        use_grid = grid_buy_price < diesel_gen_cost
                     diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
 
                     if use_grid:
@@ -671,45 +709,62 @@ class DispatchEngine:
                             )
 
                 if remaining_load > 0:
-                    total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
-                    shed_result, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
-                        remaining_load, now, dispatch_id
-                    )
-                    total_shed_actual = sum(shed_result.values())
-                    load_shed_kw = total_shed_actual + unshed_gap
+                    shed_threshold = self.strategy_params.shed_trigger_threshold_ratio
+                    gap_ratio = remaining_load / load_kw if load_kw > 0 else 1.0
+                    if gap_ratio <= shed_threshold and shed_threshold > 0:
+                        grid_fill = remaining_load
+                        grid_fill_cost = grid_fill * time_interval_hours * grid_buy_price
+                        total_cost += grid_fill_cost
+                        grid_import_kw += grid_fill
+                        load_grid_import_kwh += grid_fill * time_interval_hours
+                        remaining_load = 0
+                        notes.append(f"[甩负荷容忍带] 缺口占比{gap_ratio*100:.1f}% ≤ 阈值{shed_threshold*100:.0f}%，强制购电填补{grid_fill:.2f}kW (成本{grid_fill_cost:.4f}元)")
+                        audit_builder.add_branch(
+                            "甩负荷决策",
+                            False,
+                            f"缺口占比{gap_ratio*100:.1f}%低于阈值{shed_threshold*100:.0f}%，容忍带内强制购电填补",
+                            {"gap_ratio": gap_ratio, "threshold": shed_threshold, "grid_fill_kw": grid_fill, "reason": "shed_tolerance_band"}
+                        )
+                    else:
+                        total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
+                        shed_result, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
+                            remaining_load, now, dispatch_id
+                        )
+                        total_shed_actual = sum(shed_result.values())
+                        load_shed_kw = total_shed_actual + unshed_gap
 
-                    shed_breakdown = []
-                    for gid, kw in shed_result.items():
-                        gcfg = config.LOAD_GROUP_CONFIG[gid]
-                        shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
-                        if gid not in group_shed_details:
-                            group_shed_details[gid] = {
-                                "group_id": gid,
-                                "name": gcfg["name"],
-                                "shed_kw": round(kw, 2),
-                                "shed_priority": gcfg["shed_priority"],
-                            }
-                        else:
-                            group_shed_details[gid]["shed_kw"] = round(group_shed_details[gid]["shed_kw"] + kw, 2)
-                    if unshed_gap > 0.01:
-                        shed_breakdown.append(f"无法继续切除缺口{unshed_gap:.2f}kW")
+                        shed_breakdown = []
+                        for gid, kw in shed_result.items():
+                            gcfg = config.LOAD_GROUP_CONFIG[gid]
+                            shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
+                            if gid not in group_shed_details:
+                                group_shed_details[gid] = {
+                                    "group_id": gid,
+                                    "name": gcfg["name"],
+                                    "shed_kw": round(kw, 2),
+                                    "shed_priority": gcfg["shed_priority"],
+                                }
+                            else:
+                                group_shed_details[gid]["shed_kw"] = round(group_shed_details[gid]["shed_kw"] + kw, 2)
+                        if unshed_gap > 0.01:
+                            shed_breakdown.append(f"无法继续切除缺口{unshed_gap:.2f}kW")
 
-                    self.state.add_alert(
-                        "LOAD_SHEDDING",
-                        f"负荷缺口 {remaining_load:.2f}kW，按优先级甩负荷: {', '.join(shed_breakdown)}",
-                        {"load_kw": load_kw, "total_available_kw": total_available,
-                         "shed_kw": load_shed_kw, "shed_breakdown": shed_result,
-                         "unshed_gap_kw": round(unshed_gap, 2)}
-                    )
-                    notes.append(f"警告：按优先级甩负荷 {load_shed_kw:.2f}kW ({', '.join(shed_breakdown)})")
-                    audit_builder.add_branch(
-                        "甩负荷决策",
-                        True,
-                        f"供电能力不足，按优先级甩负荷{load_shed_kw:.2f}kW: {', '.join(shed_breakdown)}",
-                        {"shed_kw": load_shed_kw, "total_available_kw": total_available,
-                         "load_kw": load_kw, "shed_by_group": shed_result,
-                         "unshed_gap_kw": round(unshed_gap, 2)}
-                    )
+                        self.state.add_alert(
+                            "LOAD_SHEDDING",
+                            f"负荷缺口 {remaining_load:.2f}kW，按优先级甩负荷: {', '.join(shed_breakdown)}",
+                            {"load_kw": load_kw, "total_available_kw": total_available,
+                             "shed_kw": load_shed_kw, "shed_breakdown": shed_result,
+                             "unshed_gap_kw": round(unshed_gap, 2)}
+                        )
+                        notes.append(f"警告：按优先级甩负荷 {load_shed_kw:.2f}kW ({', '.join(shed_breakdown)})")
+                        audit_builder.add_branch(
+                            "甩负荷决策",
+                            True,
+                            f"供电能力不足，按优先级甩负荷{load_shed_kw:.2f}kW: {', '.join(shed_breakdown)}",
+                            {"shed_kw": load_shed_kw, "total_available_kw": total_available,
+                             "load_kw": load_kw, "shed_by_group": shed_result,
+                             "unshed_gap_kw": round(unshed_gap, 2)}
+                        )
                 else:
                     if prev_active_shed_count > 0 and remaining_load < 0:
                         surplus_for_restore = -remaining_load
@@ -839,7 +894,8 @@ class DispatchEngine:
         else:
             if remaining_load > 0:
                 max_discharge = self.state.get_bess_max_discharge_with_health(bes_id, time_interval_hours)
-                discharge_kw = min(remaining_load, max_discharge)
+                aggressiveness = self.strategy_params.battery_discharge_aggressiveness
+                discharge_kw = min(remaining_load * aggressiveness, max_discharge)
                 if discharge_kw > 0:
                     bess_action[bes_id]["discharge_kw"] = discharge_kw
                     remaining_load -= discharge_kw
@@ -867,7 +923,11 @@ class DispatchEngine:
                     )
 
                 if remaining_load > 0:
-                    use_grid = grid_buy_price < diesel_gen_cost
+                    tol_price = self.strategy_params.purchase_tolerance_price
+                    if tol_price is not None and grid_buy_price < tol_price:
+                        use_grid = True
+                    else:
+                        use_grid = grid_buy_price < diesel_gen_cost
                     diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
 
                     carbon_warning = False
@@ -1039,45 +1099,62 @@ class DispatchEngine:
                                 )
 
                     if remaining_load > 0:
-                        total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
-                        shed_result, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
-                            remaining_load, now, dispatch_id
-                        )
-                        total_shed_actual = sum(shed_result.values())
-                        load_shed_kw = total_shed_actual + unshed_gap
+                        shed_threshold = self.strategy_params.shed_trigger_threshold_ratio
+                        gap_ratio = remaining_load / load_kw if load_kw > 0 else 1.0
+                        if gap_ratio <= shed_threshold and shed_threshold > 0:
+                            grid_fill = remaining_load
+                            grid_fill_cost = grid_fill * time_interval_hours * grid_buy_price
+                            total_cost += grid_fill_cost
+                            grid_import_kw += grid_fill
+                            load_grid_import_kwh += grid_fill * time_interval_hours
+                            remaining_load = 0
+                            notes.append(f"[甩负荷容忍带] 缺口占比{gap_ratio*100:.1f}% ≤ 阈值{shed_threshold*100:.0f}%，强制购电填补{grid_fill:.2f}kW (成本{grid_fill_cost:.4f}元)")
+                            audit_builder.add_branch(
+                                "甩负荷决策",
+                                False,
+                                f"缺口占比{gap_ratio*100:.1f}%低于阈值{shed_threshold*100:.0f}%，容忍带内强制购电填补",
+                                {"gap_ratio": gap_ratio, "threshold": shed_threshold, "grid_fill_kw": grid_fill, "reason": "shed_tolerance_band"}
+                            )
+                        else:
+                            total_available = total_renewable + bess_action[bes_id]["discharge_kw"] + diesel_output[ds_id] + grid_import_kw
+                            shed_result, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
+                                remaining_load, now, dispatch_id
+                            )
+                            total_shed_actual = sum(shed_result.values())
+                            load_shed_kw = total_shed_actual + unshed_gap
 
-                        shed_breakdown = []
-                        for gid, kw in shed_result.items():
-                            gcfg = config.LOAD_GROUP_CONFIG[gid]
-                            shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
-                            if gid not in group_shed_details:
-                                group_shed_details[gid] = {
-                                    "group_id": gid,
-                                    "name": gcfg["name"],
-                                    "shed_kw": round(kw, 2),
-                                    "shed_priority": gcfg["shed_priority"],
-                                }
-                            else:
-                                group_shed_details[gid]["shed_kw"] = round(group_shed_details[gid]["shed_kw"] + kw, 2)
-                        if unshed_gap > 0.01:
-                            shed_breakdown.append(f"无法继续切除缺口{unshed_gap:.2f}kW")
+                            shed_breakdown = []
+                            for gid, kw in shed_result.items():
+                                gcfg = config.LOAD_GROUP_CONFIG[gid]
+                                shed_breakdown.append(f"{gcfg['name']}切{kw:.2f}kW")
+                                if gid not in group_shed_details:
+                                    group_shed_details[gid] = {
+                                        "group_id": gid,
+                                        "name": gcfg["name"],
+                                        "shed_kw": round(kw, 2),
+                                        "shed_priority": gcfg["shed_priority"],
+                                    }
+                                else:
+                                    group_shed_details[gid]["shed_kw"] = round(group_shed_details[gid]["shed_kw"] + kw, 2)
+                            if unshed_gap > 0.01:
+                                shed_breakdown.append(f"无法继续切除缺口{unshed_gap:.2f}kW")
 
-                        self.state.add_alert(
-                            "LOAD_SHEDDING",
-                            f"负荷缺口 {remaining_load:.2f}kW，按优先级甩负荷: {', '.join(shed_breakdown)}",
-                            {"load_kw": load_kw, "total_available_kw": total_available,
-                             "shed_kw": load_shed_kw, "shed_breakdown": shed_result,
-                             "unshed_gap_kw": round(unshed_gap, 2)}
-                        )
-                        notes.append(f"警告：按优先级甩负荷 {load_shed_kw:.2f}kW ({', '.join(shed_breakdown)})")
-                        audit_builder.add_branch(
-                            "甩负荷决策",
-                            True,
-                            f"所有可用源仍无法覆盖负荷，按优先级甩负荷{load_shed_kw:.2f}kW: {', '.join(shed_breakdown)}",
-                            {"shed_kw": load_shed_kw, "total_available_kw": total_available,
-                             "load_kw": load_kw, "shed_by_group": shed_result,
-                             "unshed_gap_kw": round(unshed_gap, 2)}
-                        )
+                            self.state.add_alert(
+                                "LOAD_SHEDDING",
+                                f"负荷缺口 {remaining_load:.2f}kW，按优先级甩负荷: {', '.join(shed_breakdown)}",
+                                {"load_kw": load_kw, "total_available_kw": total_available,
+                                 "shed_kw": load_shed_kw, "shed_breakdown": shed_result,
+                                 "unshed_gap_kw": round(unshed_gap, 2)}
+                            )
+                            notes.append(f"警告：按优先级甩负荷 {load_shed_kw:.2f}kW ({', '.join(shed_breakdown)})")
+                            audit_builder.add_branch(
+                                "甩负荷决策",
+                                True,
+                                f"所有可用源仍无法覆盖负荷，按优先级甩负荷{load_shed_kw:.2f}kW: {', '.join(shed_breakdown)}",
+                                {"shed_kw": load_shed_kw, "total_available_kw": total_available,
+                                 "load_kw": load_kw, "shed_by_group": shed_result,
+                                 "unshed_gap_kw": round(unshed_gap, 2)}
+                            )
                     else:
                         if prev_active_shed_count > 0 and remaining_load < 0:
                             surplus_for_restore = -remaining_load
@@ -1443,5 +1520,53 @@ class DispatchEngine:
 
         missed_opportunity = cost_analyzer.compute_missed_opportunity()
         self.state.add_missed_opportunity(missed_opportunity)
+
+        if dual_enabled and shadow_state_copy is not None:
+            try:
+                main_cost = decision.cost
+                main_shed_kw = decision.load_shed_kw
+                main_bess_discharge = 0.0
+                for bes_id, act in decision.bess_action.items():
+                    main_bess_discharge += act.get("discharge_kw", 0.0)
+
+                shadow_engine = DispatchEngine(
+                    state=shadow_state_copy,
+                    dr_manager=None,
+                    price_forecast_manager=None,
+                    strategy_params=ds_manager.shadow_strategy,
+                )
+                shadow_decision = shadow_engine.execute(now=now)
+
+                shadow_cost = shadow_decision.cost
+                shadow_shed_kw = shadow_decision.load_shed_kw
+                shadow_bess_discharge = 0.0
+                for bes_id, act in shadow_decision.bess_action.items():
+                    shadow_bess_discharge += act.get("discharge_kw", 0.0)
+
+                ds_manager.record_round(
+                    main_cost=main_cost,
+                    main_shed_kw=main_shed_kw,
+                    shadow_cost=shadow_cost,
+                    shadow_shed_kw=shadow_shed_kw,
+                    time_interval_hours=time_interval_hours,
+                    main_battery_discharge_kw=main_bess_discharge,
+                    shadow_battery_discharge_kw=shadow_bess_discharge,
+                    now=now,
+                )
+
+                if ds_manager.should_evaluate():
+                    eval_result = ds_manager.evaluate_and_maybe_switch(now=now, trigger="auto_cycle")
+                    if eval_result.get("switched"):
+                        decision.notes.append(
+                            f"[策略自动切换] {eval_result.get('note', '')} "
+                            f"(评估{eval_result.get('rounds_evaluated', 0)}轮，"
+                            f"成本改善{eval_result.get('cost_improvement_ratio', 0)*100:.1f}%)"
+                        )
+                    else:
+                        decision.notes.append(
+                            f"[策略周期评估] {eval_result.get('note', '')}"
+                        )
+            except Exception as e:
+                decision.notes.append(f"[双策略异常] 影子策略执行或评估失败: {str(e)}")
 
         return decision

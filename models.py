@@ -411,6 +411,322 @@ class CostAttributionSummary:
     breakdown: Dict[str, float] = field(default_factory=dict)
 
 
+@dataclass
+class StrategyParams:
+    battery_discharge_aggressiveness: float = 1.0
+    purchase_tolerance_price: Optional[float] = None
+    shed_trigger_threshold_ratio: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "battery_discharge_aggressiveness": self.battery_discharge_aggressiveness,
+            "purchase_tolerance_price": self.purchase_tolerance_price,
+            "shed_trigger_threshold_ratio": self.shed_trigger_threshold_ratio,
+        }
+
+
+@dataclass
+class StrategyRoundRecord:
+    round_index: int
+    timestamp: datetime
+    main_cost: float
+    main_shed_kw: float
+    shadow_cost: float
+    shadow_shed_kw: float
+    main_battery_discharge_kw: float = 0.0
+    shadow_battery_discharge_kw: float = 0.0
+
+
+@dataclass
+class StrategySwitchRecord:
+    switch_id: str
+    timestamp: datetime
+    trigger: str
+    old_main_params: Dict[str, Any]
+    new_main_params: Dict[str, Any]
+    old_shadow_params: Dict[str, Any]
+    rounds_evaluated: int
+    main_total_cost: float
+    shadow_total_cost: float
+    cost_improvement_ratio: float
+    main_total_shed_kwh: float
+    shadow_total_shed_kwh: float
+    note: str = ""
+
+
+class DualStrategyManager:
+    def __init__(self):
+        ds_cfg = config.DUAL_STRATEGY_CONFIG
+        self.enable = ds_cfg.get("enable_dual_strategy", True)
+        self.evaluation_cycle_rounds = ds_cfg.get("evaluation_cycle_rounds", 50)
+        self.cost_improvement_threshold = ds_cfg.get("cost_improvement_threshold", 0.15)
+
+        main_cfg = ds_cfg["main_strategy"]
+        shadow_cfg = ds_cfg["shadow_strategy"]
+        self.main_strategy = StrategyParams(
+            battery_discharge_aggressiveness=main_cfg["battery_discharge_aggressiveness"],
+            purchase_tolerance_price=main_cfg["purchase_tolerance_price"],
+            shed_trigger_threshold_ratio=main_cfg["shed_trigger_threshold_ratio"],
+        )
+        self.shadow_strategy = StrategyParams(
+            battery_discharge_aggressiveness=shadow_cfg["battery_discharge_aggressiveness"],
+            purchase_tolerance_price=shadow_cfg["purchase_tolerance_price"],
+            shed_trigger_threshold_ratio=shadow_cfg["shed_trigger_threshold_ratio"],
+        )
+
+        self.current_cycle_rounds: int = 0
+        self.main_total_cost: float = 0.0
+        self.shadow_total_cost: float = 0.0
+        self.main_total_shed_kwh: float = 0.0
+        self.shadow_total_shed_kwh: float = 0.0
+        self.round_records: List[StrategyRoundRecord] = []
+        self.switch_history: List[StrategySwitchRecord] = []
+        self._switch_counter: int = 0
+
+    def _generate_switch_id(self) -> str:
+        self._switch_counter += 1
+        return f"SWITCH-{self._switch_counter:06d}"
+
+    def record_round(self, main_cost: float, main_shed_kw: float, shadow_cost: float,
+                     shadow_shed_kw: float, time_interval_hours: float,
+                     main_battery_discharge_kw: float = 0.0,
+                     shadow_battery_discharge_kw: float = 0.0,
+                     now: Optional[datetime] = None) -> None:
+        if not self.enable:
+            return
+        if now is None:
+            now = datetime.now()
+        self.current_cycle_rounds += 1
+        self.main_total_cost += main_cost
+        self.shadow_total_cost += shadow_cost
+        self.main_total_shed_kwh += main_shed_kw * time_interval_hours
+        self.shadow_total_shed_kwh += shadow_shed_kw * time_interval_hours
+        record = StrategyRoundRecord(
+            round_index=self.current_cycle_rounds,
+            timestamp=now,
+            main_cost=main_cost,
+            main_shed_kw=main_shed_kw,
+            shadow_cost=shadow_cost,
+            shadow_shed_kw=shadow_shed_kw,
+            main_battery_discharge_kw=main_battery_discharge_kw,
+            shadow_battery_discharge_kw=shadow_battery_discharge_kw,
+        )
+        self.round_records.append(record)
+
+    def should_evaluate(self) -> bool:
+        if not self.enable:
+            return False
+        return self.current_cycle_rounds >= self.evaluation_cycle_rounds
+
+    def evaluate_and_maybe_switch(self, now: Optional[datetime] = None,
+                                  trigger: str = "auto_cycle") -> Dict[str, Any]:
+        if not self.enable:
+            return {"switched": False, "reason": "dual_strategy_disabled"}
+        if now is None:
+            now = datetime.now()
+
+        if self.current_cycle_rounds == 0:
+            return {"switched": False, "reason": "no_rounds_recorded"}
+
+        main_cost = self.main_total_cost
+        shadow_cost = self.shadow_total_cost
+        main_shed = self.main_total_shed_kwh
+        shadow_shed = self.shadow_total_shed_kwh
+        rounds = self.current_cycle_rounds
+
+        if main_cost > 0:
+            improvement_ratio = (main_cost - shadow_cost) / main_cost
+        else:
+            improvement_ratio = 0.0 if shadow_cost == 0 else 1.0
+
+        switched = False
+        note = ""
+
+        if (improvement_ratio >= self.cost_improvement_threshold and
+                shadow_shed <= main_shed + 1e-9):
+            old_main = deepcopy(self.main_strategy.to_dict())
+            old_shadow = deepcopy(self.shadow_strategy.to_dict())
+            self.main_strategy = StrategyParams(
+                battery_discharge_aggressiveness=self.shadow_strategy.battery_discharge_aggressiveness,
+                purchase_tolerance_price=self.shadow_strategy.purchase_tolerance_price,
+                shed_trigger_threshold_ratio=self.shadow_strategy.shed_trigger_threshold_ratio,
+            )
+            switch_rec = StrategySwitchRecord(
+                switch_id=self._generate_switch_id(),
+                timestamp=now,
+                trigger=trigger,
+                old_main_params=old_main,
+                new_main_params=self.main_strategy.to_dict(),
+                old_shadow_params=old_shadow,
+                rounds_evaluated=rounds,
+                main_total_cost=main_cost,
+                shadow_total_cost=shadow_cost,
+                cost_improvement_ratio=improvement_ratio,
+                main_total_shed_kwh=main_shed,
+                shadow_total_shed_kwh=shadow_shed,
+                note=f"影子策略优于主策略{improvement_ratio*100:.1f}%，且甩负荷不增加，自动提升为主策略",
+            )
+            self.switch_history.append(switch_rec)
+            self._reset_cycle()
+            switched = True
+            note = switch_rec.note
+        else:
+            reasons = []
+            if improvement_ratio < self.cost_improvement_threshold:
+                reasons.append(f"成本改善率{improvement_ratio*100:.1f}%未达到阈值{self.cost_improvement_threshold*100:.0f}%")
+            if shadow_shed > main_shed + 1e-9:
+                reasons.append(f"影子策略甩负荷更多(影子{shadow_shed:.2f}kWh vs 主{main_shed:.2f}kWh)")
+            note = "未切换: " + "; ".join(reasons) if reasons else "未切换: 未知原因"
+            self._reset_cycle()
+
+        return {
+            "switched": switched,
+            "trigger": trigger,
+            "rounds_evaluated": rounds,
+            "main_total_cost": round(main_cost, 4),
+            "shadow_total_cost": round(shadow_cost, 4),
+            "cost_improvement_ratio": round(improvement_ratio, 4),
+            "main_total_shed_kwh": round(main_shed, 4),
+            "shadow_total_shed_kwh": round(shadow_shed, 4),
+            "threshold_ratio": self.cost_improvement_threshold,
+            "note": note,
+        }
+
+    def force_switch(self, now: Optional[datetime] = None) -> Dict[str, Any]:
+        if not self.enable:
+            return {"switched": False, "reason": "dual_strategy_disabled"}
+        if now is None:
+            now = datetime.now()
+
+        rounds = self.current_cycle_rounds
+        main_cost = self.main_total_cost
+        shadow_cost = self.shadow_total_cost
+        main_shed = self.main_total_shed_kwh
+        shadow_shed = self.shadow_total_shed_kwh
+        if main_cost > 0:
+            improvement_ratio = (main_cost - shadow_cost) / main_cost
+        else:
+            improvement_ratio = 0.0 if shadow_cost == 0 else 1.0
+
+        old_main = deepcopy(self.main_strategy.to_dict())
+        old_shadow = deepcopy(self.shadow_strategy.to_dict())
+        self.main_strategy = StrategyParams(
+            battery_discharge_aggressiveness=self.shadow_strategy.battery_discharge_aggressiveness,
+            purchase_tolerance_price=self.shadow_strategy.purchase_tolerance_price,
+            shed_trigger_threshold_ratio=self.shadow_strategy.shed_trigger_threshold_ratio,
+        )
+        switch_rec = StrategySwitchRecord(
+            switch_id=self._generate_switch_id(),
+            timestamp=now,
+            trigger="manual_force",
+            old_main_params=old_main,
+            new_main_params=self.main_strategy.to_dict(),
+            old_shadow_params=old_shadow,
+            rounds_evaluated=rounds,
+            main_total_cost=main_cost,
+            shadow_total_cost=shadow_cost,
+            cost_improvement_ratio=improvement_ratio,
+            main_total_shed_kwh=main_shed,
+            shadow_total_shed_kwh=shadow_shed,
+            note="手动强制切换，将影子策略提升为主策略",
+        )
+        self.switch_history.append(switch_rec)
+        self._reset_cycle()
+
+        return {
+            "switched": True,
+            "trigger": "manual_force",
+            "rounds_evaluated": rounds,
+            "main_total_cost": round(main_cost, 4),
+            "shadow_total_cost": round(shadow_cost, 4),
+            "cost_improvement_ratio": round(improvement_ratio, 4),
+            "main_total_shed_kwh": round(main_shed, 4),
+            "shadow_total_shed_kwh": round(shadow_shed, 4),
+            "note": switch_rec.note,
+        }
+
+    def _reset_cycle(self):
+        self.current_cycle_rounds = 0
+        self.main_total_cost = 0.0
+        self.shadow_total_cost = 0.0
+        self.main_total_shed_kwh = 0.0
+        self.shadow_total_shed_kwh = 0.0
+        self.round_records = []
+
+    def update_shadow_strategy(self,
+                               battery_discharge_aggressiveness: Optional[float] = None,
+                               purchase_tolerance_price: Optional[float] = None,
+                               shed_trigger_threshold_ratio: Optional[float] = None) -> Dict[str, Any]:
+        updated = {}
+        if battery_discharge_aggressiveness is not None:
+            if not (0.0 <= battery_discharge_aggressiveness <= 1.0):
+                return {"success": False, "error": "battery_discharge_aggressiveness 必须在 [0, 1] 区间内"}
+            self.shadow_strategy.battery_discharge_aggressiveness = battery_discharge_aggressiveness
+            updated["battery_discharge_aggressiveness"] = battery_discharge_aggressiveness
+        if purchase_tolerance_price is not None:
+            if purchase_tolerance_price is not None and purchase_tolerance_price < 0:
+                return {"success": False, "error": "purchase_tolerance_price 不能为负数"}
+            self.shadow_strategy.purchase_tolerance_price = purchase_tolerance_price
+            updated["purchase_tolerance_price"] = purchase_tolerance_price
+        if shed_trigger_threshold_ratio is not None:
+            if not (0.0 <= shed_trigger_threshold_ratio <= 1.0):
+                return {"success": False, "error": "shed_trigger_threshold_ratio 必须在 [0, 1] 区间内"}
+            self.shadow_strategy.shed_trigger_threshold_ratio = shed_trigger_threshold_ratio
+            updated["shed_trigger_threshold_ratio"] = shed_trigger_threshold_ratio
+
+        if not updated:
+            return {"success": False, "error": "未提供任何要更新的参数"}
+
+        return {"success": True, "updated": updated, "current_shadow": self.shadow_strategy.to_dict()}
+
+    def get_progress(self) -> Dict[str, Any]:
+        if self.main_total_cost > 0:
+            improvement_ratio = (self.main_total_cost - self.shadow_total_cost) / self.main_total_cost
+        else:
+            improvement_ratio = 0.0 if self.shadow_total_cost == 0 else 1.0
+        return {
+            "enabled": self.enable,
+            "evaluation_cycle_rounds": self.evaluation_cycle_rounds,
+            "cost_improvement_threshold": self.cost_improvement_threshold,
+            "current_cycle_rounds": self.current_cycle_rounds,
+            "progress_percent": round(self.current_cycle_rounds / self.evaluation_cycle_rounds * 100, 1)
+                if self.evaluation_cycle_rounds > 0 else 0,
+            "main_total_cost": round(self.main_total_cost, 4),
+            "shadow_total_cost": round(self.shadow_total_cost, 4),
+            "main_total_shed_kwh": round(self.main_total_shed_kwh, 4),
+            "shadow_total_shed_kwh": round(self.shadow_total_shed_kwh, 4),
+            "cost_improvement_ratio": round(improvement_ratio, 4),
+            "meets_switch_condition": (
+                improvement_ratio >= self.cost_improvement_threshold and
+                self.shadow_total_shed_kwh <= self.main_total_shed_kwh + 1e-9
+                and self.current_cycle_rounds > 0
+            ),
+        }
+
+    def get_switch_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        history = self.switch_history[-limit:]
+        result = []
+        for rec in reversed(history):
+            result.append({
+                "switch_id": rec.switch_id,
+                "timestamp": rec.timestamp.isoformat(),
+                "trigger": rec.trigger,
+                "trigger_chinese": {"auto_cycle": "周期自动评估", "manual_eval": "手动触发评估",
+                                    "manual_force": "手动强制切换"}.get(rec.trigger, rec.trigger),
+                "old_main_params": rec.old_main_params,
+                "new_main_params": rec.new_main_params,
+                "old_shadow_params": rec.old_shadow_params,
+                "rounds_evaluated": rec.rounds_evaluated,
+                "main_total_cost": round(rec.main_total_cost, 4),
+                "shadow_total_cost": round(rec.shadow_total_cost, 4),
+                "cost_improvement_ratio": round(rec.cost_improvement_ratio, 4),
+                "main_total_shed_kwh": round(rec.main_total_shed_kwh, 4),
+                "shadow_total_shed_kwh": round(rec.shadow_total_shed_kwh, 4),
+                "note": rec.note,
+            })
+        return result
+
+
 class MicrogridState:
     HEALTH_WINDOW_SIZE = 50
     HEALTH_WARNING_THRESHOLD = 60.0
@@ -514,6 +830,8 @@ class MicrogridState:
 
         self.carbon_manager = None
         self._init_carbon_manager()
+
+        self.dual_strategy_manager = DualStrategyManager()
 
     def _init_carbon_manager(self):
         from carbon_manager import CarbonManager

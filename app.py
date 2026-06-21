@@ -2287,6 +2287,122 @@ def health_check():
     })
 
 
+@app.route("/api/dual-strategy/params", methods=["GET"])
+def get_dual_strategy_params():
+    """查询当前主策略和影子策略的参数配置"""
+    ds = state.dual_strategy_manager
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "enabled": ds.enable,
+        "evaluation_cycle_rounds": ds.evaluation_cycle_rounds,
+        "cost_improvement_threshold": ds.cost_improvement_threshold,
+        "main_strategy": ds.main_strategy.to_dict(),
+        "shadow_strategy": ds.shadow_strategy.to_dict(),
+    })
+
+
+@app.route("/api/dual-strategy/shadow-params", methods=["PUT"])
+def update_shadow_strategy_params():
+    """修改影子策略参数(立即生效影响下一轮对比计算)
+    请求体: {
+        "battery_discharge_aggressiveness": 0.6,   (可选, 0~1)
+        "purchase_tolerance_price": 1.0,           (可选, 元/kWh, null表示用分时电价)
+        "shed_trigger_threshold_ratio": 0.05       (可选, 0~1)
+    }
+    """
+    data = request.get_json(force=True) or {}
+    result = state.dual_strategy_manager.update_shadow_strategy(
+        battery_discharge_aggressiveness=data.get("battery_discharge_aggressiveness"),
+        purchase_tolerance_price=data.get("purchase_tolerance_price"),
+        shed_trigger_threshold_ratio=data.get("shed_trigger_threshold_ratio"),
+    )
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "参数更新失败")}), 400
+    return jsonify({
+        "status": "ok",
+        "message": "影子策略参数已更新，立即生效（影响下一轮调度对比计算）",
+        "updated": result.get("updated"),
+        "current_shadow": result.get("current_shadow"),
+    })
+
+
+@app.route("/api/dual-strategy/progress", methods=["GET"])
+def get_dual_strategy_progress():
+    """查询当前对比进度(已跑多少轮、两套策略各自的累计成本和甩负荷统计)"""
+    ds = state.dual_strategy_manager
+    progress = ds.get_progress()
+    round_records = []
+    for rec in ds.round_records:
+        round_records.append({
+            "round_index": rec.round_index,
+            "timestamp": rec.timestamp.isoformat(),
+            "main_cost": round(rec.main_cost, 4),
+            "main_shed_kw": round(rec.main_shed_kw, 2),
+            "shadow_cost": round(rec.shadow_cost, 4),
+            "shadow_shed_kw": round(rec.shadow_shed_kw, 2),
+            "main_battery_discharge_kw": round(rec.main_battery_discharge_kw, 2),
+            "shadow_battery_discharge_kw": round(rec.shadow_battery_discharge_kw, 2),
+        })
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "progress": progress,
+        "recent_rounds": round_records[-20:],
+        "total_rounds_recorded": len(round_records),
+    })
+
+
+@app.route("/api/dual-strategy/switch-history", methods=["GET"])
+def get_dual_strategy_switch_history():
+    """查询历史切换记录(什么时候从哪套切到哪套)
+    参数: limit (可选, 默认50)
+    """
+    try:
+        limit = int(request.args.get("limit", 50))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+    ds = state.dual_strategy_manager
+    history = ds.get_switch_history(limit=limit)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "total_switches": len(ds.switch_history),
+        "returned": len(history),
+        "history": history,
+    })
+
+
+@app.route("/api/dual-strategy/evaluate", methods=["POST"])
+def dual_strategy_evaluate_now():
+    """手动触发立即评估(不等50轮满就做一次对比判断)"""
+    ds = state.dual_strategy_manager
+    if not ds.enable:
+        return jsonify({"error": "双策略功能未启用"}), 400
+    now = datetime.now()
+    result = ds.evaluate_and_maybe_switch(now=now, trigger="manual_eval")
+    return jsonify({
+        "status": "ok",
+        "query_time": now.isoformat(),
+        "evaluation_result": result,
+    })
+
+
+@app.route("/api/dual-strategy/force-switch", methods=["POST"])
+def dual_strategy_force_switch():
+    """手动强制切换(不管对比结果直接把影子提升为主)"""
+    ds = state.dual_strategy_manager
+    if not ds.enable:
+        return jsonify({"error": "双策略功能未启用"}), 400
+    now = datetime.now()
+    result = ds.force_switch(now=now)
+    return jsonify({
+        "status": "ok",
+        "query_time": now.isoformat(),
+        "switch_result": result,
+    })
+
+
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({"error": "接口不存在", "available_endpoints": _list_endpoints()}), 404
@@ -2358,6 +2474,12 @@ def _list_endpoints():
         "GET /api/report/<report_id> - 单份报告详情",
         "DELETE /api/report/<report_id> - 删除报告",
         "GET /api/health - 健康检查",
+        "GET /api/dual-strategy/params - 查询主策略和影子策略参数配置",
+        "PUT /api/dual-strategy/shadow-params - 修改影子策略参数",
+        "GET /api/dual-strategy/progress - 查询当前对比进度和累计统计",
+        "GET /api/dual-strategy/switch-history - 查询策略切换历史记录",
+        "POST /api/dual-strategy/evaluate - 手动触发立即评估对比",
+        "POST /api/dual-strategy/force-switch - 手动强制切换影子为主策略",
     ]
 
 

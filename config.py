@@ -182,3 +182,20 @@ CARBON_CONFIG = {
     "exceed_penalty_multiplier": 3.0,
     "emergency_grid_limit_ratio": 0.5,
 }
+
+
+DUAL_STRATEGY_CONFIG = {
+    "enable_dual_strategy": True,
+    "evaluation_cycle_rounds": 50,
+    "cost_improvement_threshold": 0.15,
+    "main_strategy": {
+        "battery_discharge_aggressiveness": 1.0,
+        "purchase_tolerance_price": None,
+        "shed_trigger_threshold_ratio": 0.0,
+    },
+    "shadow_strategy": {
+        "battery_discharge_aggressiveness": 0.6,
+        "purchase_tolerance_price": 1.0,
+        "shed_trigger_threshold_ratio": 0.05,
+    },
+}
