@@ -2808,3 +2808,74 @@ class WeeklyReport:
     total_load_shed_events: int
     total_load_shed_duration_minutes: float
     suggestions: List[StrategySuggestion]
+
+
+@dataclass
+class ReplayConstraint:
+    constraint_type: str
+    description: str
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TheoreticalOptimalDecision:
+    bess_discharge_kw: float
+    grid_import_kw: float
+    load_served_kw: float
+    load_shed_kw: float
+    total_cost: float
+    diesel_output_kw: float = 0.0
+    grid_export_kw: float = 0.0
+    cost_breakdown: Dict[str, float] = field(default_factory=dict)
+    constraints_applied: List[ReplayConstraint] = field(default_factory=list)
+
+
+@dataclass
+class DecisionQualityResult:
+    replay_id: str
+    audit_id: str
+    dispatch_id: str
+    timestamp: datetime
+    quality_score: float
+    is_low_score: bool
+    actual_cost: float
+    theoretical_optimal_cost: float
+    cost_difference: float
+    cost_savings_potential: float
+    theoretical_optimal: TheoreticalOptimalDecision
+    actual_summary: OutputSummary
+    constraints_applied: List[ReplayConstraint]
+    explanation: str = ""
+
+
+@dataclass
+class QualityScoreTrendPoint:
+    time_key: str
+    avg_quality_score: float
+    dispatch_count: int
+    min_score: float
+    max_score: float
+    low_score_count: int
+
+
+@dataclass
+class LowScoreRecord:
+    quality_result: DecisionQualityResult
+    actual_vs_optimal: Dict[str, Any]
+
+
+@dataclass
+class BatchReplayResult:
+    start_time: datetime
+    end_time: datetime
+    total_records: int
+    avg_quality_score: float
+    min_quality_score: float
+    max_quality_score: float
+    low_score_count: int
+    low_score_ratio: float
+    consecutive_low_score_warning: bool
+    consecutive_low_score_count: int
+    individual_results: List[DecisionQualityResult]
+    alert_generated: bool = False
+    alert_message: str = ""

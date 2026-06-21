@@ -7,11 +7,13 @@ import config
 from models import MicrogridState, SourceReport, LoadReport
 from dispatcher import DispatchEngine
 from audit import DecisionComparator
+from decision_replay import DecisionReplayEngine, LOW_SCORE_THRESHOLD
 
 app = Flask(__name__)
 
 state = MicrogridState()
 engine = DispatchEngine(state)
+replay_engine = DecisionReplayEngine(state)
 
 
 def _serialize(obj):
@@ -2400,6 +2402,270 @@ def dual_strategy_force_switch():
         "status": "ok",
         "query_time": now.isoformat(),
         "switch_result": result,
+    })
+
+
+def _theoretical_optimal_to_dict(opt):
+    return {
+        "bess_discharge_kw": opt.bess_discharge_kw,
+        "grid_import_kw": opt.grid_import_kw,
+        "load_served_kw": opt.load_served_kw,
+        "load_shed_kw": opt.load_shed_kw,
+        "total_cost": opt.total_cost,
+        "diesel_output_kw": opt.diesel_output_kw,
+        "grid_export_kw": opt.grid_export_kw,
+        "cost_breakdown": opt.cost_breakdown,
+        "constraints_applied": [
+            {
+                "constraint_type": c.constraint_type,
+                "description": c.description,
+                "details": c.details,
+            }
+            for c in opt.constraints_applied
+        ],
+    }
+
+
+def _quality_result_to_dict(result):
+    return {
+        "replay_id": result.replay_id,
+        "audit_id": result.audit_id,
+        "dispatch_id": result.dispatch_id,
+        "timestamp": result.timestamp.isoformat(),
+        "quality_score": result.quality_score,
+        "is_low_score": result.is_low_score,
+        "score_level": "优秀" if result.quality_score >= 90 else "良好" if result.quality_score >= 70 else "一般" if result.quality_score >= 60 else "较差",
+        "actual_cost": result.actual_cost,
+        "theoretical_optimal_cost": result.theoretical_optimal_cost,
+        "cost_difference": result.cost_difference,
+        "cost_savings_potential": result.cost_savings_potential,
+        "theoretical_optimal": _theoretical_optimal_to_dict(result.theoretical_optimal),
+        "actual_summary": {
+            "load_served_kw": result.actual_summary.load_served_kw,
+            "load_shed_kw": result.actual_summary.load_shed_kw,
+            "load_coverage_ratio": round(result.actual_summary.load_coverage_ratio * 100, 2),
+            "total_cost": result.actual_summary.total_cost,
+            "pv_share_kw": result.actual_summary.pv_share_kw,
+            "wt_share_kw": result.actual_summary.wt_share_kw,
+            "diesel_share_kw": result.actual_summary.diesel_share_kw,
+            "bess_discharge_kw": result.actual_summary.bess_discharge_kw,
+            "grid_import_kw": result.actual_summary.grid_import_kw,
+            "grid_export_kw": result.actual_summary.grid_export_kw,
+            "cost_breakdown": result.actual_summary.cost_breakdown,
+        },
+        "constraints_applied": [
+            {
+                "constraint_type": c.constraint_type,
+                "description": c.description,
+                "details": c.details,
+            }
+            for c in result.constraints_applied
+        ],
+        "explanation": result.explanation,
+    }
+
+
+def _low_score_record_to_dict(record):
+    return {
+        "quality_result": _quality_result_to_dict(record.quality_result),
+        "actual_vs_optimal": record.actual_vs_optimal,
+    }
+
+
+@app.route("/api/decision-replay/single", methods=["POST"])
+def replay_single_decision():
+    """
+    单条历史决策回放评分
+    请求体: {
+        "audit_id": "AUDIT-00000001"
+    }
+    返回质量分、理论最优方案、与实际方案的对比
+    """
+    data = request.get_json(force=True) or {}
+    audit_id = data.get("audit_id")
+
+    if not audit_id:
+        return jsonify({"error": "缺少必填字段: audit_id"}), 400
+
+    result = replay_engine.replay_single(audit_id)
+    if result is None:
+        return jsonify({"error": f"未找到审计日志: {audit_id}"}), 404
+
+    return jsonify({
+        "status": "ok",
+        "message": "回放评分完成",
+        "result": _quality_result_to_dict(result),
+    })
+
+
+@app.route("/api/decision-replay/batch", methods=["POST"])
+def replay_batch_decisions():
+    """
+    批量历史决策回放评分
+    请求体: {
+        "start_time": "2024-06-18T00:00:00",
+        "end_time": "2024-06-18T23:59:59"
+    }
+    返回所有记录的质量分、平均分、以及连续低分告警
+    """
+    data = request.get_json(force=True) or {}
+    start_time_str = data.get("start_time")
+    end_time_str = data.get("end_time")
+
+    if not start_time_str or not end_time_str:
+        return jsonify({"error": "缺少必填字段: start_time 和 end_time"}), 400
+
+    try:
+        start_time = datetime.fromisoformat(start_time_str)
+        end_time = datetime.fromisoformat(end_time_str)
+    except ValueError:
+        return jsonify({"error": "时间格式错误，请使用ISO格式"}), 400
+
+    if start_time >= end_time:
+        return jsonify({"error": "start_time 必须小于 end_time"}), 400
+
+    replay_engine.clear_replay_results()
+    batch_result = replay_engine.replay_batch(start_time, end_time)
+
+    individual_results = [
+        _quality_result_to_dict(r) for r in batch_result.individual_results
+    ]
+
+    return jsonify({
+        "status": "ok",
+        "message": "批量回放评分完成" if not batch_result.alert_generated else "批量回放评分完成，检测到连续低分告警",
+        "summary": {
+            "start_time": batch_result.start_time.isoformat(),
+            "end_time": batch_result.end_time.isoformat(),
+            "total_records": batch_result.total_records,
+            "avg_quality_score": batch_result.avg_quality_score,
+            "min_quality_score": batch_result.min_quality_score,
+            "max_quality_score": batch_result.max_quality_score,
+            "low_score_count": batch_result.low_score_count,
+            "low_score_ratio": batch_result.low_score_ratio,
+            "low_score_ratio_percent": round(batch_result.low_score_ratio * 100, 2),
+            "consecutive_low_score_warning": batch_result.consecutive_low_score_warning,
+            "consecutive_low_score_count": batch_result.consecutive_low_score_count,
+            "alert_generated": batch_result.alert_generated,
+            "alert_message": batch_result.alert_message,
+        },
+        "individual_results": individual_results,
+    })
+
+
+@app.route("/api/decision-replay/trend", methods=["GET"])
+def get_quality_score_trend():
+    """
+    查询质量分趋势（按小时/天聚合）
+    参数:
+      - granularity: 聚合粒度，可选 hour/day，默认 hour
+      - start_time: 开始时间 (ISO格式，可选)
+      - end_time: 结束时间 (ISO格式，可选)
+    """
+    try:
+        granularity = request.args.get("granularity", "hour")
+        start_time_str = request.args.get("start_time")
+        end_time_str = request.args.get("end_time")
+
+        if granularity not in ("hour", "day"):
+            return jsonify({"error": "granularity 必须是 hour 或 day"}), 400
+
+        start_time = datetime.fromisoformat(start_time_str) if start_time_str else None
+        end_time = datetime.fromisoformat(end_time_str) if end_time_str else None
+
+        trend = replay_engine.get_quality_trend(
+            start_time=start_time,
+            end_time=end_time,
+            granularity=granularity,
+        )
+
+        trend_data = []
+        for point in trend:
+            trend_data.append({
+                "time_key": point.time_key,
+                "avg_quality_score": point.avg_quality_score,
+                "dispatch_count": point.dispatch_count,
+                "min_score": point.min_score,
+                "max_score": point.max_score,
+                "low_score_count": point.low_score_count,
+                "low_score_ratio": round(point.low_score_count / point.dispatch_count, 4) if point.dispatch_count > 0 else 0,
+            })
+
+        return jsonify({
+            "status": "ok",
+            "granularity": granularity,
+            "total_points": len(trend_data),
+            "trend": trend_data,
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/decision-replay/low-scores", methods=["GET"])
+def get_low_score_records():
+    """
+    查询低分记录列表（含实际方案和理论最优方案的对比）
+    参数:
+      - threshold: 质量分阈值，默认60
+      - start_time: 开始时间 (ISO格式，可选)
+      - end_time: 结束时间 (ISO格式，可选)
+      - limit: 返回数量限制，默认100
+    """
+    try:
+        threshold = float(request.args.get("threshold", LOW_SCORE_THRESHOLD))
+        start_time_str = request.args.get("start_time")
+        end_time_str = request.args.get("end_time")
+        limit = int(request.args.get("limit", 100))
+
+        if threshold < 0 or threshold > 100:
+            return jsonify({"error": "threshold 必须在 [0, 100] 区间内"}), 400
+
+        start_time = datetime.fromisoformat(start_time_str) if start_time_str else None
+        end_time = datetime.fromisoformat(end_time_str) if end_time_str else None
+
+        records = replay_engine.get_low_score_records(
+            threshold=threshold,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+
+        return jsonify({
+            "status": "ok",
+            "query": {
+                "threshold": threshold,
+                "start_time": start_time_str,
+                "end_time": end_time_str,
+                "limit": limit,
+            },
+            "total_returned": len(records),
+            "records": [_low_score_record_to_dict(r) for r in records],
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/decision-replay/config", methods=["GET"])
+def get_replay_config():
+    """查询回放评分配置参数"""
+    from decision_replay import (
+        DISCHARGE_STEP_KW, LOW_SCORE_THRESHOLD,
+        CONSECUTIVE_LOW_SCORE_THRESHOLD, CONSECUTIVE_LOW_SCORE_ROUNDS,
+    )
+    return jsonify({
+        "status": "ok",
+        "config": {
+            "discharge_step_kw": DISCHARGE_STEP_KW,
+            "low_score_threshold": LOW_SCORE_THRESHOLD,
+            "consecutive_low_score_threshold": CONSECUTIVE_LOW_SCORE_THRESHOLD,
+            "consecutive_low_score_rounds": CONSECUTIVE_LOW_SCORE_ROUNDS,
+            "description": {
+                "discharge_step_kw": "电池放电量穷举步长（kW）",
+                "low_score_threshold": "低分判定阈值（分），低于此分数标红",
+                "consecutive_low_score_threshold": "连续低分告警阈值（分）",
+                "consecutive_low_score_rounds": "连续低分告警轮数，连续超过此轮数低于阈值触发告警",
+            }
+        },
     })
 
 
