@@ -355,8 +355,8 @@ class CostAttribution:
     load_shed_penalty_cost: float
     bess_loss_cost: float
     feed_in_revenue: float
-    carbon_exceed_penalty_cost: float = 0.0
     total_comprehensive_cost: float
+    carbon_exceed_penalty_cost: float = 0.0
     details: Dict[str, Any] = field(default_factory=dict)
 
 

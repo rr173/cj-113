@@ -296,25 +296,61 @@ class DispatchEngine:
                 diesel_cap = self.state.get_available_diesel_capacity(ds_id, now)
 
                 if use_grid:
-                    grid_import_load = remaining_load
-                    remaining_load = 0
-                    load_cost = grid_import_load * time_interval_hours * grid_buy_price
-                    total_cost += load_cost
-                    grid_import_kw += grid_import_load
-                    load_grid_import_kwh += grid_import_load * time_interval_hours
-                    notes.append(f"[主动充电] 谷时购电供负荷 {grid_import_load:.2f}kW")
-                    audit_builder.add_branch(
-                        "购电决策",
-                        True,
-                        f"谷时电价({grid_buy_price}元)低于柴油成本({diesel_gen_cost}元)，选择购电供负荷",
-                        {"grid_import_kw": grid_import_load, "reason": "grid_cheaper_than_diesel"}
-                    )
-                    audit_builder.add_branch(
-                        "柴油机启动决策",
-                        False,
-                        "购电成本更低，不启动柴油机",
-                        {"grid_price": grid_buy_price, "diesel_cost": diesel_gen_cost}
-                    )
+                    carbon_emergency = False
+                    if carbon_enabled and carbon_status_info:
+                        if carbon_status_info["status"] in ("emergency", "exceeded"):
+                            carbon_emergency = True
+
+                    if carbon_emergency:
+                        grid_limit_ratio = config.CARBON_CONFIG["emergency_grid_limit_ratio"]
+                        grid_import_load = remaining_load * grid_limit_ratio
+                        remaining_after_grid = remaining_load - grid_import_load
+                        carbon_shed_occurred = True
+
+                        load_cost = grid_import_load * time_interval_hours * grid_buy_price
+                        total_cost += load_cost
+                        grid_import_kw += grid_import_load
+                        load_grid_import_kwh += grid_import_load * time_interval_hours
+                        remaining_load = remaining_after_grid
+
+                        notes.append(
+                            f"[碳紧急] 购电限制在缺口的{grid_limit_ratio*100:.0f}%，"
+                            f"购电{grid_import_load:.2f}kW，剩余{remaining_after_grid:.2f}kW走甩负荷"
+                        )
+                        audit_builder.add_branch(
+                            "购电决策",
+                            True,
+                            f"碳紧急状态，购电限制在缺口的{grid_limit_ratio*100:.0f}%，"
+                            f"购电{grid_import_load:.2f}kW",
+                            {"grid_import_kw": grid_import_load, "reason": "carbon_emergency_limit",
+                             "limit_ratio": grid_limit_ratio}
+                        )
+                        audit_builder.add_branch(
+                            "柴油机启动决策",
+                            False,
+                            "碳紧急状态，禁止启动柴油机",
+                            {"reason": "carbon_emergency_prohibition"}
+                        )
+                    else:
+                        grid_import_load = remaining_load
+                        remaining_load = 0
+                        load_cost = grid_import_load * time_interval_hours * grid_buy_price
+                        total_cost += load_cost
+                        grid_import_kw += grid_import_load
+                        load_grid_import_kwh += grid_import_load * time_interval_hours
+                        notes.append(f"[主动充电] 谷时购电供负荷 {grid_import_load:.2f}kW")
+                        audit_builder.add_branch(
+                            "购电决策",
+                            True,
+                            f"谷时电价({grid_buy_price}元)低于柴油成本({diesel_gen_cost}元)，选择购电供负荷",
+                            {"grid_import_kw": grid_import_load, "reason": "grid_cheaper_than_diesel"}
+                        )
+                        audit_builder.add_branch(
+                            "柴油机启动决策",
+                            False,
+                            "购电成本更低，不启动柴油机",
+                            {"grid_price": grid_buy_price, "diesel_cost": diesel_gen_cost}
+                        )
                 elif force_discharge:
                     audit_builder.add_branch(
                         "购电决策",
@@ -338,28 +374,60 @@ class DispatchEngine:
                                 carbon_reason = "碳预警状态，强制放电模式下不启动柴油机会甩负荷，允许启动"
 
                     if carbon_enabled and not carbon_can_start_diesel:
+                        is_emergency = carbon_status_info["status"] in ("emergency", "exceeded")
                         if not force_discharge:
-                            grid_import_load = remaining_load
-                            remaining_load_after = 0
-                            load_cost = grid_import_load * time_interval_hours * grid_buy_price
-                            total_cost += load_cost
-                            grid_import_kw += grid_import_load
-                            load_grid_import_kwh += grid_import_load * time_interval_hours
-                            notes.append(f"[碳约束] {carbon_reason}，改用购电 {grid_import_load:.2f}kW")
-                            audit_builder.add_branch(
-                                "购电决策",
-                                True,
-                                f"{carbon_reason}，强制购电 {grid_import_load:.2f}kW",
-                                {"grid_import_kw": grid_import_load, "reason": "carbon_constraint",
-                                 "carbon_status": carbon_status_info["status"]}
-                            )
-                            audit_builder.add_branch(
-                                "柴油机启动决策",
-                                False,
-                                carbon_reason,
-                                {"reason": "carbon_constraint", "carbon_status": carbon_status_info["status"]}
-                            )
-                            remaining_load = remaining_load_after
+                            if is_emergency:
+                                grid_limit_ratio = config.CARBON_CONFIG["emergency_grid_limit_ratio"]
+                                grid_import_load = remaining_load * grid_limit_ratio
+                                remaining_load_after = remaining_load - grid_import_load
+                                carbon_shed_occurred = True
+
+                                load_cost = grid_import_load * time_interval_hours * grid_buy_price
+                                total_cost += load_cost
+                                grid_import_kw += grid_import_load
+                                load_grid_import_kwh += grid_import_load * time_interval_hours
+                                remaining_load = remaining_load_after
+
+                                notes.append(
+                                    f"[碳紧急] 购电限制在缺口的{grid_limit_ratio*100:.0f}%，"
+                                    f"购电{grid_import_load:.2f}kW，剩余{remaining_load_after:.2f}kW走甩负荷"
+                                )
+                                audit_builder.add_branch(
+                                    "购电决策",
+                                    True,
+                                    f"碳紧急状态，购电限制在缺口的{grid_limit_ratio*100:.0f}%，"
+                                    f"购电{grid_import_load:.2f}kW",
+                                    {"grid_import_kw": grid_import_load, "reason": "carbon_emergency_limit",
+                                     "limit_ratio": grid_limit_ratio}
+                                )
+                                audit_builder.add_branch(
+                                    "柴油机启动决策",
+                                    False,
+                                    carbon_reason,
+                                    {"reason": "carbon_constraint", "carbon_status": carbon_status_info["status"]}
+                                )
+                            else:
+                                grid_import_load = remaining_load
+                                remaining_load_after = 0
+                                load_cost = grid_import_load * time_interval_hours * grid_buy_price
+                                total_cost += load_cost
+                                grid_import_kw += grid_import_load
+                                load_grid_import_kwh += grid_import_load * time_interval_hours
+                                notes.append(f"[碳约束] {carbon_reason}，改用购电 {grid_import_load:.2f}kW")
+                                audit_builder.add_branch(
+                                    "购电决策",
+                                    True,
+                                    f"{carbon_reason}，强制购电 {grid_import_load:.2f}kW",
+                                    {"grid_import_kw": grid_import_load, "reason": "carbon_constraint",
+                                     "carbon_status": carbon_status_info["status"]}
+                                )
+                                audit_builder.add_branch(
+                                    "柴油机启动决策",
+                                    False,
+                                    carbon_reason,
+                                    {"reason": "carbon_constraint", "carbon_status": carbon_status_info["status"]}
+                                )
+                                remaining_load = remaining_load_after
                         else:
                             notes.append(f"[碳约束] {carbon_reason}，且强制放电模式禁止购电")
                             audit_builder.add_branch(
@@ -1317,24 +1385,26 @@ class DispatchEngine:
             carbon_record = self.state.carbon_manager.record_emission(
                 dispatch_id, total_diesel_kwh, total_grid_kwh, now
             )
-            if carbon_record and carbon_status_info["is_exceeded"]:
+            if carbon_record:
                 carbon_exceed_penalty = self.state.carbon_manager.calculate_exceed_penalty(
                     carbon_record.total_emission_kg, grid_buy_price
                 )
-                total_cost += carbon_exceed_penalty
-                notes.append(f"[碳超标] 碳排放超标罚款 {carbon_exceed_penalty:.4f}元")
-                self.state.add_alert(
-                    "CARBON_EXCEED_PENALTY",
-                    f"碳排放超标，本次调度罚款 {carbon_exceed_penalty:.4f}元，"
-                    f"累计排放 {self.state.carbon_manager.quota_state.accumulated_emission_kg:.2f}kgCO2",
-                    {
-                        "dispatch_id": dispatch_id,
-                        "penalty_amount": carbon_exceed_penalty,
-                        "total_emission_kg": carbon_record.total_emission_kg,
-                        "accumulated_emission_kg": self.state.carbon_manager.quota_state.accumulated_emission_kg,
-                        "monthly_quota_kg": self.state.carbon_manager.quota_state.monthly_quota_kg,
-                    }
-                )
+                if carbon_exceed_penalty > 0:
+                    total_cost += carbon_exceed_penalty
+                    decision.cost = total_cost
+                    notes.append(f"[碳超标] 碳排放超标罚款 {carbon_exceed_penalty:.4f}元")
+                    self.state.add_alert(
+                        "CARBON_EXCEED_PENALTY",
+                        f"碳排放超标，本次调度罚款 {carbon_exceed_penalty:.4f}元，"
+                        f"累计排放 {self.state.carbon_manager.quota_state.accumulated_emission_kg:.2f}kgCO2",
+                        {
+                            "dispatch_id": dispatch_id,
+                            "penalty_amount": carbon_exceed_penalty,
+                            "total_emission_kg": carbon_record.total_emission_kg,
+                            "accumulated_emission_kg": self.state.carbon_manager.quota_state.accumulated_emission_kg,
+                            "monthly_quota_kg": self.state.carbon_manager.quota_state.monthly_quota_kg,
+                        }
+                    )
 
         if carbon_shed_occurred:
             from models import AnomalyMarker
