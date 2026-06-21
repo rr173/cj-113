@@ -170,3 +170,15 @@ DYNAMIC_SHED_CONFIG = {
     "score_peak_hour": 10,
     "score_recent_shed": 25,
 }
+
+
+CARBON_CONFIG = {
+    "enable_carbon_tracking": True,
+    "diesel_emission_factor": 0.85,
+    "grid_emission_factor": 0.6,
+    "monthly_quota_kg": 5000.0,
+    "warning_threshold_ratio": 0.8,
+    "emergency_threshold_ratio": 0.95,
+    "exceed_penalty_multiplier": 3.0,
+    "emergency_grid_limit_ratio": 0.5,
+}

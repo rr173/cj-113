@@ -454,13 +454,15 @@ class DecisionComparator:
 class CostAttributionAnalyzer:
     def __init__(self, state: MicrogridState, decision: DispatchDecision,
                  dispatch_id: str, now: datetime, time_interval_hours: float,
-                 diesel_startup_occurred: bool = False):
+                 diesel_startup_occurred: bool = False,
+                 carbon_exceed_penalty: float = 0.0):
         self.state = state
         self.decision = decision
         self.dispatch_id = dispatch_id
         self.now = now
         self.time_interval_hours = time_interval_hours
         self.diesel_startup_occurred = diesel_startup_occurred
+        self.carbon_exceed_penalty = carbon_exceed_penalty
 
     def compute_attribution(self) -> CostAttribution:
         grid_purchase_cost = self._compute_grid_purchase_cost()
@@ -468,9 +470,11 @@ class CostAttributionAnalyzer:
         load_shed_penalty = self._compute_load_shed_penalty()
         bess_loss_cost = self._compute_bess_loss_cost()
         feed_in_revenue = self._compute_feed_in_revenue()
+        carbon_exceed_penalty_cost = self.carbon_exceed_penalty
 
         total_comprehensive = (grid_purchase_cost + diesel_gen_cost + diesel_startup_cost +
-                               load_shed_penalty + bess_loss_cost - feed_in_revenue)
+                               load_shed_penalty + bess_loss_cost - feed_in_revenue +
+                               carbon_exceed_penalty_cost)
 
         attribution_id = self.state.generate_cost_attribution_id()
 
@@ -481,6 +485,7 @@ class CostAttributionAnalyzer:
             "load_shed_kwh": self.decision.load_shed_kw * self.time_interval_hours,
             "feed_in_kwh": self.decision.grid_export_kw * self.time_interval_hours,
             "tariff_period": self.decision.tariff_period,
+            "carbon_exceed_penalty": carbon_exceed_penalty_cost,
         }
 
         return CostAttribution(
@@ -493,6 +498,7 @@ class CostAttributionAnalyzer:
             load_shed_penalty_cost=round(load_shed_penalty, 4),
             bess_loss_cost=round(bess_loss_cost, 4),
             feed_in_revenue=round(feed_in_revenue, 4),
+            carbon_exceed_penalty_cost=round(carbon_exceed_penalty_cost, 4),
             total_comprehensive_cost=round(total_comprehensive, 4),
             details=details,
         )

@@ -355,8 +355,35 @@ class CostAttribution:
     load_shed_penalty_cost: float
     bess_loss_cost: float
     feed_in_revenue: float
+    carbon_exceed_penalty_cost: float = 0.0
     total_comprehensive_cost: float
     details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CarbonEmissionRecord:
+    record_id: str
+    dispatch_id: str
+    timestamp: datetime
+    diesel_emission_kg: float
+    grid_emission_kg: float
+    total_emission_kg: float
+    diesel_generated_kwh: float
+    grid_import_kwh: float
+    carbon_status: str
+    quota_remaining_ratio: float
+
+
+@dataclass
+class CarbonQuotaState:
+    current_month: str
+    monthly_quota_kg: float
+    accumulated_emission_kg: float
+    current_status: str
+    warning_threshold_kg: float
+    emergency_threshold_kg: float
+    last_reset_time: Optional[datetime] = None
+    daily_emissions: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -377,6 +404,7 @@ class CostAttributionSummary:
     total_load_shed_penalty: float
     total_bess_loss_cost: float
     total_feed_in_revenue: float
+    total_carbon_exceed_penalty: float
     total_comprehensive_cost: float
     total_missed_savings: float
     dispatch_count: int
@@ -483,6 +511,13 @@ class MicrogridState:
         self._report_generator = None
 
         self.alert_manager = AlertManager()
+
+        self.carbon_manager = None
+        self._init_carbon_manager()
+
+    def _init_carbon_manager(self):
+        from carbon_manager import CarbonManager
+        self.carbon_manager = CarbonManager(self)
 
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
@@ -1469,6 +1504,7 @@ class MicrogridState:
         total_shed = sum(a.load_shed_penalty_cost for a in filtered_attrs)
         total_bess_loss = sum(a.bess_loss_cost for a in filtered_attrs)
         total_feedin = sum(a.feed_in_revenue for a in filtered_attrs)
+        total_carbon_exceed = sum(a.carbon_exceed_penalty_cost for a in filtered_attrs)
         total_comprehensive = sum(a.total_comprehensive_cost for a in filtered_attrs)
 
         filtered_opps = []
@@ -1487,6 +1523,7 @@ class MicrogridState:
             "load_shed_penalty": total_shed,
             "bess_loss": total_bess_loss,
             "feed_in_revenue": total_feedin,
+            "carbon_exceed_penalty": total_carbon_exceed,
         }
 
         return CostAttributionSummary(
@@ -1495,6 +1532,7 @@ class MicrogridState:
             total_load_shed_penalty=round(total_shed, 4),
             total_bess_loss_cost=round(total_bess_loss, 4),
             total_feed_in_revenue=round(total_feedin, 4),
+            total_carbon_exceed_penalty=round(total_carbon_exceed, 4),
             total_comprehensive_cost=round(total_comprehensive, 4),
             total_missed_savings=round(total_missed, 4),
             dispatch_count=len(filtered_attrs),

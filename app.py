@@ -2109,6 +2109,155 @@ def process_notifications():
     })
 
 
+@app.route("/api/carbon/quota/status", methods=["GET"])
+def get_carbon_quota_status():
+    """查询当月碳排放累计值和配额使用率"""
+    if not config.CARBON_CONFIG.get("enable_carbon_tracking", False):
+        return jsonify({"error": "碳排放追踪未启用"}), 400
+    status = state.carbon_manager.get_current_quota_state()
+    return jsonify({
+        "status": "ok",
+        "data": status,
+    })
+
+
+@app.route("/api/carbon/records", methods=["GET"])
+def get_carbon_emission_records():
+    """查询碳排放明细（每次调度贡献了多少，按柴油和购电分开）
+    参数:
+      - start_time: ISO格式时间字符串，可选
+      - end_time: ISO格式时间字符串，可选
+      - limit: 返回条数，默认100
+      - offset: 偏移量，默认0
+    """
+    if not config.CARBON_CONFIG.get("enable_carbon_tracking", False):
+        return jsonify({"error": "碳排放追踪未启用"}), 400
+
+    start_time_str = request.args.get("start_time")
+    end_time_str = request.args.get("end_time")
+    limit = int(request.args.get("limit", 100))
+    offset = int(request.args.get("offset", 0))
+
+    start_time = None
+    end_time = None
+    try:
+        if start_time_str:
+            start_time = datetime.fromisoformat(start_time_str)
+        if end_time_str:
+            end_time = datetime.fromisoformat(end_time_str)
+    except ValueError:
+        return jsonify({"error": "时间格式错误，请使用ISO格式"}), 400
+
+    records = state.carbon_manager.get_emission_records(
+        start_time=start_time,
+        end_time=end_time,
+        limit=limit,
+        offset=offset,
+    )
+
+    result = []
+    for r in records:
+        result.append({
+            "record_id": r.record_id,
+            "dispatch_id": r.dispatch_id,
+            "timestamp": r.timestamp.isoformat(),
+            "diesel_emission_kg": r.diesel_emission_kg,
+            "grid_emission_kg": r.grid_emission_kg,
+            "total_emission_kg": r.total_emission_kg,
+            "diesel_generated_kwh": r.diesel_generated_kwh,
+            "grid_import_kwh": r.grid_import_kwh,
+            "carbon_status": r.carbon_status,
+            "quota_remaining_ratio": r.quota_remaining_ratio,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "total": len(state.carbon_manager.carbon_emission_records),
+        "count": len(result),
+        "limit": limit,
+        "offset": offset,
+        "records": result,
+    })
+
+
+@app.route("/api/carbon/quota", methods=["PUT"])
+def update_carbon_quota():
+    """修改月度碳配额值（立即生效影响当月剩余判断）
+    请求体: {
+        "monthly_quota_kg": 6000.0
+    }
+    """
+    if not config.CARBON_CONFIG.get("enable_carbon_tracking", False):
+        return jsonify({"error": "碳排放追踪未启用"}), 400
+
+    data = request.get_json(silent=True) or {}
+    new_quota = data.get("monthly_quota_kg")
+    if new_quota is None or new_quota <= 0:
+        return jsonify({"error": "请提供有效的月度配额值（monthly_quota_kg > 0）"}), 400
+
+    success = state.carbon_manager.update_monthly_quota(float(new_quota))
+    if not success:
+        return jsonify({"error": "配额修改失败"}), 500
+
+    status = state.carbon_manager.get_current_quota_state()
+    return jsonify({
+        "status": "ok",
+        "message": "月度碳配额已更新",
+        "data": status,
+    })
+
+
+@app.route("/api/carbon/daily-trend", methods=["GET"])
+def get_carbon_daily_trend():
+    """查询碳排放日趋势（每天排了多少）
+    参数:
+      - start_date: 开始日期，格式 YYYY-MM-DD，可选
+      - end_date: 结束日期，格式 YYYY-MM-DD，可选
+    """
+    if not config.CARBON_CONFIG.get("enable_carbon_tracking", False):
+        return jsonify({"error": "碳排放追踪未启用"}), 400
+
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+
+    trend = state.carbon_manager.get_daily_trend(
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    return jsonify({
+        "status": "ok",
+        "days": len(trend),
+        "trend": trend,
+    })
+
+
+@app.route("/api/carbon/reset", methods=["POST"])
+def reset_carbon_accumulated():
+    """手动重置当月累计（用于配额购买后增加额度的场景）
+    请求体: {
+        "add_quota_kg": 1000.0    (可选，增加的配额量)
+    }
+    """
+    if not config.CARBON_CONFIG.get("enable_carbon_tracking", False):
+        return jsonify({"error": "碳排放追踪未启用"}), 400
+
+    data = request.get_json(silent=True) or {}
+    add_quota_kg = float(data.get("add_quota_kg", 0.0))
+
+    success = state.carbon_manager.reset_monthly_accumulated(add_quota_kg=add_quota_kg)
+    if not success:
+        return jsonify({"error": "重置失败"}), 500
+
+    status = state.carbon_manager.get_current_quota_state()
+    return jsonify({
+        "status": "ok",
+        "message": "当月累计碳排放已重置" if add_quota_kg <= 0 else f"当月累计已重置，配额增加 {add_quota_kg}kg",
+        "add_quota_kg": add_quota_kg,
+        "data": status,
+    })
+
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({
