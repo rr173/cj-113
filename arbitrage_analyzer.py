@@ -231,11 +231,14 @@ class ArbitrageAnalyzer:
             discharge_kwh = rec.actual_discharge_kw * rec.time_interval_hours
 
             if rec.tariff_period == "valley":
-                if rec.is_active_arbitrage and rec.charge_from_grid_kw > 0:
-                    valley_active_charge_kwh += charge_kwh
-                elif charge_kwh > 0:
-                    if config.ARBITRAGE_ANALYSIS_CONFIG.get("passive_charge_from_renewable", True):
-                        valley_passive_charge_kwh += charge_kwh
+                if charge_kwh > 0:
+                    grid_charge_kwh = rec.charge_from_grid_kw * rec.time_interval_hours
+                    renewable_charge_kwh = rec.charge_from_renewable_kw * rec.time_interval_hours
+
+                    if grid_charge_kwh > 0:
+                        valley_active_charge_kwh += grid_charge_kwh
+                    if renewable_charge_kwh > 0 and config.ARBITRAGE_ANALYSIS_CONFIG.get("passive_charge_from_renewable", True):
+                        valley_passive_charge_kwh += renewable_charge_kwh
             elif rec.tariff_period == "peak":
                 peak_discharge_kwh += discharge_kwh
 
