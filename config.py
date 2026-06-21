@@ -199,3 +199,13 @@ DUAL_STRATEGY_CONFIG = {
         "shed_trigger_threshold_ratio": 0.05,
     },
 }
+
+
+ARBITRAGE_ANALYSIS_CONFIG = {
+    "enable_arbitrage_analysis": True,
+    "settlement_hour": 0,
+    "settlement_minute": 0,
+    "low_execution_rate_threshold": 50.0,
+    "consecutive_low_days_threshold": 3,
+    "passive_charge_from_renewable": True,
+}

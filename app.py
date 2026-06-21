@@ -2669,6 +2669,377 @@ def get_replay_config():
     })
 
 
+def _arbitrage_settlement_to_dict(s):
+    return {
+        "settlement_id": s.settlement_id,
+        "settlement_date": s.settlement_date,
+        "generated_at": s.generated_at.isoformat(),
+        "is_recalculation": s.is_recalculation,
+        "valley_active_charge_kwh": round(s.valley_active_charge_kwh, 4),
+        "valley_passive_charge_kwh": round(s.valley_passive_charge_kwh, 4),
+        "valley_total_charge_kwh": round(s.valley_active_charge_kwh + s.valley_passive_charge_kwh, 4),
+        "peak_discharge_kwh": round(s.peak_discharge_kwh, 4),
+        "valley_charge_price": s.valley_charge_price,
+        "peak_discharge_price": s.peak_discharge_price,
+        "price_spread": round(s.peak_discharge_price - s.valley_charge_price, 4),
+        "theoretical_revenue": round(s.theoretical_revenue, 4),
+        "efficiency_loss_cost": round(s.efficiency_loss_cost, 4),
+        "net_revenue": round(s.net_revenue, 4),
+        "theoretical_max_net_revenue": round(s.theoretical_max_net_revenue, 4),
+        "execution_rate": round(s.execution_rate, 2),
+        "execution_rate_level": "优秀" if s.execution_rate >= 80 else "良好" if s.execution_rate >= 50 else "较差",
+        "interruption_count": s.interruption_count,
+        "total_lost_revenue": round(s.total_lost_revenue, 4),
+        "interruptions": [
+            {
+                "interruption_id": i.interruption_id,
+                "timestamp": i.timestamp.isoformat(),
+                "hour": i.hour,
+                "reason": i.reason,
+                "reason_category": i.reason_category,
+                "planned_mode": i.planned_mode,
+                "planned_mode_chinese": {
+                    "active_charge": "主动充电",
+                    "priority_discharge": "优先放电",
+                    "normal": "常规模式",
+                }.get(i.planned_mode, "未知"),
+                "lost_charge_kwh": round(i.lost_charge_kwh, 4),
+                "lost_discharge_kwh": round(i.lost_discharge_kwh, 4),
+                "lost_revenue": round(i.lost_revenue, 4),
+                "details": i.details,
+            }
+            for i in s.interruptions
+        ],
+        "valley_hours_count": s.valley_hours_count,
+        "peak_hours_count": s.peak_hours_count,
+        "baseline_savings": round(s.baseline_savings, 4),
+        "baseline_savings_diff": round(s.net_revenue - s.baseline_savings, 4),
+        "notes": s.notes,
+        "battery_config": {
+            "charge_efficiency": s.charge_efficiency,
+            "discharge_efficiency": s.discharge_efficiency,
+            "capacity_kwh": s.battery_capacity_kwh,
+            "max_charge_power_kw": s.max_charge_power_kw,
+            "max_discharge_power_kw": s.max_discharge_power_kw,
+        },
+    }
+
+
+@app.route("/api/arbitrage/settlement/<date_str>", methods=["GET"])
+def get_arbitrage_settlement(date_str):
+    """
+    查询指定日期的套利结算详情
+    参数:
+      - date_str: 日期，格式 YYYY-MM-DD (URL路径参数)
+    返回: 充电量/放电量/理论收益/净收益/执行率/中断记录等完整信息
+    """
+    try:
+        from datetime import datetime
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "日期格式错误，应为 YYYY-MM-DD"}), 400
+
+    settlement = state.arbitrage_analyzer.get_settlement(date_str)
+    if settlement is None:
+        return jsonify({
+            "status": "not_found",
+            "message": f"日期 {date_str} 暂无套利结算记录",
+            "settlement_date": date_str,
+        }), 404
+
+    return jsonify({
+        "status": "ok",
+        "settlement": _arbitrage_settlement_to_dict(settlement),
+    })
+
+
+@app.route("/api/arbitrage/summary", methods=["GET"])
+def get_arbitrage_summary():
+    """
+    查询日期范围内的套利汇总
+    参数:
+      - start_date: 开始日期，格式 YYYY-MM-DD
+      - end_date: 结束日期，格式 YYYY-MM-DD
+    返回: 总净收益/平均执行率/中断次数等汇总统计
+    """
+    try:
+        start_date_str = request.args.get("start_date")
+        end_date_str = request.args.get("end_date")
+
+        if not start_date_str or not end_date_str:
+            return jsonify({"error": "缺少必填参数: start_date 和 end_date"}), 400
+
+        from datetime import datetime
+        datetime.strptime(start_date_str, "%Y-%m-%d")
+        datetime.strptime(end_date_str, "%Y-%m-%d")
+
+        summary = state.arbitrage_analyzer.get_settlement_summary(start_date_str, end_date_str)
+
+        return jsonify({
+            "status": "ok",
+            "summary": {
+                "start_date": summary.start_date,
+                "end_date": summary.end_date,
+                "settlement_count": summary.settlement_count,
+                "total_net_revenue": round(summary.total_net_revenue, 4),
+                "total_theoretical_revenue": round(summary.total_theoretical_revenue, 4),
+                "total_efficiency_loss_cost": round(summary.total_efficiency_loss_cost, 4),
+                "avg_execution_rate": round(summary.avg_execution_rate, 2),
+                "total_interruptions": summary.total_interruptions,
+                "total_lost_revenue": round(summary.total_lost_revenue, 4),
+                "total_valley_active_charge_kwh": round(summary.total_valley_active_charge_kwh, 4),
+                "total_valley_passive_charge_kwh": round(summary.total_valley_passive_charge_kwh, 4),
+                "total_valley_charge_kwh": round(
+                    summary.total_valley_active_charge_kwh + summary.total_valley_passive_charge_kwh, 4
+                ),
+                "total_peak_discharge_kwh": round(summary.total_peak_discharge_kwh, 4),
+                "total_baseline_savings": round(summary.total_baseline_savings, 4),
+                "low_execution_rate_days": summary.low_execution_rate_days,
+                "high_execution_rate_days": summary.high_execution_rate_days,
+                "avg_net_revenue_per_day": round(
+                    summary.total_net_revenue / summary.settlement_count, 4
+                ) if summary.settlement_count > 0 else 0.0,
+            },
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/arbitrage/trend", methods=["GET"])
+def get_arbitrage_trend():
+    """
+    查询套利趋势（按天的净收益和执行率走势）
+    参数:
+      - start_date: 开始日期，格式 YYYY-MM-DD
+      - end_date: 结束日期，格式 YYYY-MM-DD
+    返回: 每日净收益、执行率、充放电量等趋势数据
+    """
+    try:
+        start_date_str = request.args.get("start_date")
+        end_date_str = request.args.get("end_date")
+
+        if not start_date_str or not end_date_str:
+            return jsonify({"error": "缺少必填参数: start_date 和 end_date"}), 400
+
+        from datetime import datetime
+        datetime.strptime(start_date_str, "%Y-%m-%d")
+        datetime.strptime(end_date_str, "%Y-%m-%d")
+
+        trend = state.arbitrage_analyzer.get_trend(start_date_str, end_date_str)
+
+        trend_data = []
+        for point in trend:
+            trend_data.append({
+                "date": point.date,
+                "net_revenue": round(point.net_revenue, 4),
+                "execution_rate": round(point.execution_rate, 2),
+                "execution_rate_level": "优秀" if point.execution_rate >= 80 else "良好" if point.execution_rate >= 50 else "较差",
+                "theoretical_revenue": round(point.theoretical_revenue, 4),
+                "interruption_count": point.interruption_count,
+                "valley_charge_kwh": round(point.valley_charge_kwh, 4),
+                "peak_discharge_kwh": round(point.peak_discharge_kwh, 4),
+            })
+
+        total_net = sum(p.net_revenue for p in trend)
+        avg_rate = sum(p.execution_rate for p in trend) / len(trend) if trend else 0.0
+
+        return jsonify({
+            "status": "ok",
+            "query_range": {
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+            },
+            "summary": {
+                "total_net_revenue": round(total_net, 4),
+                "avg_execution_rate": round(avg_rate, 2),
+                "total_days": len(trend_data),
+            },
+            "trend": trend_data,
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/arbitrage/resettle/<date_str>", methods=["POST"])
+def resettle_arbitrage_day(date_str):
+    """
+    手动触发某天的结算重算（参数修正后可以重算历史）
+    参数:
+      - date_str: 日期，格式 YYYY-MM-DD (URL路径参数)
+    返回: 重算后的结算详情
+    """
+    try:
+        from datetime import datetime
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "日期格式错误，应为 YYYY-MM-DD"}), 400
+
+    try:
+        settlement = state.arbitrage_analyzer.resettle_day(date_str)
+        return jsonify({
+            "status": "ok",
+            "message": f"日期 {date_str} 套利结算已重算完成",
+            "settlement": _arbitrage_settlement_to_dict(settlement),
+        })
+    except Exception as e:
+        return jsonify({"error": f"结算重算失败: {str(e)}"}), 500
+
+
+@app.route("/api/arbitrage/alerts", methods=["GET"])
+def get_arbitrage_alerts():
+    """
+    查询套利相关告警列表
+    参数:
+      - acknowledged: 是否已确认，可选 true/false，默认全部
+      - limit: 返回数量限制，默认50
+    """
+    try:
+        ack_str = request.args.get("acknowledged")
+        limit = int(request.args.get("limit", 50))
+
+        acknowledged = None
+        if ack_str is not None:
+            acknowledged = ack_str.lower() in ("true", "1", "yes", "y")
+
+        alerts = state.arbitrage_analyzer.get_alerts(acknowledged=acknowledged, limit=limit)
+
+        return jsonify({
+            "status": "ok",
+            "total": len(state.arbitrage_analyzer.alerts),
+            "returned": len(alerts),
+            "filter": {
+                "acknowledged": acknowledged,
+                "limit": limit,
+            },
+            "alerts": [
+                {
+                    "alert_id": a.alert_id,
+                    "timestamp": a.timestamp.isoformat(),
+                    "alert_type": a.alert_type,
+                    "alert_level": a.alert_level,
+                    "message": a.message,
+                    "details": a.details,
+                    "acknowledged": a.acknowledged,
+                    "acknowledged_at": a.acknowledged_at.isoformat() if a.acknowledged_at else None,
+                    "acknowledged_by": a.acknowledged_by,
+                }
+                for a in reversed(alerts)
+            ],
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/arbitrage/alerts/<alert_id>/acknowledge", methods=["POST"])
+def acknowledge_arbitrage_alert(alert_id):
+    """
+    确认套利告警
+    参数:
+      - alert_id: 告警ID (URL路径参数)
+    请求体 (可选):
+      - acknowledged_by: 确认人标识
+    """
+    data = request.get_json(silent=True) or {}
+    acknowledged_by = data.get("acknowledged_by")
+
+    success = state.arbitrage_analyzer.acknowledge_alert(alert_id, acknowledged_by)
+    if not success:
+        return jsonify({"error": f"未找到告警或已确认: {alert_id}"}), 404
+
+    return jsonify({
+        "status": "ok",
+        "message": f"套利告警 {alert_id} 已确认",
+        "alert_id": alert_id,
+    })
+
+
+@app.route("/api/arbitrage/hourly/<date_str>", methods=["GET"])
+def get_arbitrage_hourly_records(date_str):
+    """
+    查询指定日期的逐小时套利记录（用于调试和深入分析）
+    参数:
+      - date_str: 日期，格式 YYYY-MM-DD (URL路径参数)
+    """
+    try:
+        from datetime import datetime
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "日期格式错误，应为 YYYY-MM-DD"}), 400
+
+    records = state.arbitrage_analyzer.get_hourly_records(date_str)
+
+    return jsonify({
+        "status": "ok",
+        "date": date_str,
+        "total_records": len(records),
+        "records": [
+            {
+                "timestamp": r.timestamp.isoformat(),
+                "hour": r.hour,
+                "tariff_period": r.tariff_period,
+                "tariff_period_chinese": {
+                    "valley": "谷时段",
+                    "flat": "平时段",
+                    "peak": "峰时段",
+                }.get(r.tariff_period, "未知"),
+                "planned_mode": r.planned_mode,
+                "planned_mode_chinese": {
+                    "active_charge": "主动充电",
+                    "priority_discharge": "优先放电",
+                    "normal": "常规模式",
+                }.get(r.planned_mode, "未知"),
+                "actual_charge_kw": round(r.actual_charge_kw, 4),
+                "actual_discharge_kw": round(r.actual_discharge_kw, 4),
+                "charge_from_grid_kw": round(r.charge_from_grid_kw, 4),
+                "charge_from_renewable_kw": round(r.charge_from_renewable_kw, 4),
+                "charge_kwh": round(r.actual_charge_kw * r.time_interval_hours, 4),
+                "discharge_kwh": round(r.actual_discharge_kw * r.time_interval_hours, 4),
+                "is_active_arbitrage": r.is_active_arbitrage,
+                "interrupted": r.interrupted,
+                "interruption_reason": r.interruption_reason,
+                "time_interval_hours": r.time_interval_hours,
+                "grid_buy_price": r.grid_buy_price,
+                "soc_before": round(r.soc_before * 100, 2),
+                "soc_after": round(r.soc_after * 100, 2),
+            }
+            for r in records
+        ],
+    })
+
+
+@app.route("/api/arbitrage/config", methods=["GET"])
+def get_arbitrage_config():
+    """查询套利分析配置参数"""
+    cfg = config.ARBITRAGE_ANALYSIS_CONFIG
+    return jsonify({
+        "status": "ok",
+        "config": {
+            "enable_arbitrage_analysis": cfg.get("enable_arbitrage_analysis", True),
+            "settlement_time": f"{cfg.get('settlement_hour', 0):02d}:{cfg.get('settlement_minute', 0):02d}",
+            "low_execution_rate_threshold": cfg.get("low_execution_rate_threshold", 50.0),
+            "consecutive_low_days_threshold": cfg.get("consecutive_low_days_threshold", 3),
+            "passive_charge_from_renewable": cfg.get("passive_charge_from_renewable", True),
+            "tariff": {
+                "valley_price": config.get_valley_price(),
+                "peak_price": config.get_peak_price(),
+                "flat_price": config.get_flat_price(),
+                "valley_hours": config.GRID_TARIFF["valley"]["hours"],
+                "peak_hours": config.GRID_TARIFF["peak"]["hours"],
+            },
+            "bess": {
+                bid: {
+                    "capacity_kwh": bcfg["capacity_kwh"],
+                    "max_charge_power": bcfg["max_charge_power"],
+                    "max_discharge_power": bcfg["max_discharge_power"],
+                    "charge_efficiency": bcfg["charge_efficiency"],
+                    "discharge_efficiency": bcfg["discharge_efficiency"],
+                }
+                for bid, bcfg in config.BESS_CONFIG.items()
+            },
+        },
+    })
+
+
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({"error": "接口不存在", "available_endpoints": _list_endpoints()}), 404
@@ -2746,6 +3117,14 @@ def _list_endpoints():
         "GET /api/dual-strategy/switch-history - 查询策略切换历史记录",
         "POST /api/dual-strategy/evaluate - 手动触发立即评估对比",
         "POST /api/dual-strategy/force-switch - 手动强制切换影子为主策略",
+        "GET /api/arbitrage/settlement/<date> - 查询指定日期的套利结算详情",
+        "GET /api/arbitrage/summary - 查询日期范围内的套利汇总",
+        "GET /api/arbitrage/trend - 查询套利趋势（按天净收益和执行率走势）",
+        "POST /api/arbitrage/resettle/<date> - 手动触发某天的结算重算",
+        "GET /api/arbitrage/alerts - 查询套利相关告警列表",
+        "POST /api/arbitrage/alerts/<alert_id>/acknowledge - 确认套利告警",
+        "GET /api/arbitrage/hourly/<date> - 查询指定日期的逐小时套利记录",
+        "GET /api/arbitrage/config - 查询套利分析配置参数",
     ]
 
 

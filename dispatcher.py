@@ -1569,4 +1569,47 @@ class DispatchEngine:
             except Exception as e:
                 decision.notes.append(f"[双策略异常] 影子策略执行或评估失败: {str(e)}")
 
+        if self.state.arbitrage_analyzer:
+            bes_id = list(config.BESS_CONFIG.keys())[0]
+            bess_act = decision.bess_action.get(bes_id, {})
+            soc_before_val = bess_act.get("soc_before", 0.0)
+            soc_after_val = bess_act.get("soc_after", 0.0)
+
+            grid_charge_kw = 0.0
+            renewable_charge_kw = 0.0
+            charge_total = bess_act.get("charge_kw", 0.0)
+            if charge_total > 0:
+                total_renewable = self.state.get_total_renewable_kw()
+                renewable_for_load = min(total_renewable, load_kw)
+                renewable_surplus = max(0.0, total_renewable - renewable_for_load)
+                renewable_charge_kw = min(renewable_surplus, charge_total)
+                grid_charge_kw = max(0.0, charge_total - renewable_charge_kw)
+
+            plan_active_val = True
+            plan_abnormal_val = False
+            if current_hour_plan:
+                plan_active_val = current_hour_plan.active
+                plan_abnormal_val = current_hour_plan.abnormal
+
+            try:
+                self.state.arbitrage_analyzer.record_dispatch(
+                    decision=decision,
+                    now=now,
+                    time_interval_hours=time_interval_hours,
+                    storage_mode=storage_mode,
+                    plan_active=plan_active_val,
+                    plan_abnormal=plan_abnormal_val,
+                    soc_before=soc_before_val,
+                    soc_after=soc_after_val,
+                    charge_from_grid_kw=grid_charge_kw,
+                    charge_from_renewable_kw=renewable_charge_kw,
+                )
+            except Exception:
+                pass
+
+            try:
+                self.state.arbitrage_analyzer.auto_settle_if_due(now)
+            except Exception:
+                pass
+
         return decision

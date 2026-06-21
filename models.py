@@ -833,9 +833,16 @@ class MicrogridState:
 
         self.dual_strategy_manager = DualStrategyManager()
 
+        self.arbitrage_analyzer = None
+        self._init_arbitrage_analyzer()
+
     def _init_carbon_manager(self):
         from carbon_manager import CarbonManager
         self.carbon_manager = CarbonManager(self)
+
+    def _init_arbitrage_analyzer(self):
+        from arbitrage_analyzer import ArbitrageAnalyzer
+        self.arbitrage_analyzer = ArbitrageAnalyzer(self)
 
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
@@ -2879,3 +2886,117 @@ class BatchReplayResult:
     individual_results: List[DecisionQualityResult]
     alert_generated: bool = False
     alert_message: str = ""
+
+
+@dataclass
+class ArbitrageInterruptionRecord:
+    interruption_id: str
+    timestamp: datetime
+    hour: int
+    reason: str
+    reason_category: str
+    planned_mode: str
+    lost_charge_kwh: float = 0.0
+    lost_discharge_kwh: float = 0.0
+    lost_revenue: float = 0.0
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ArbitrageSettlementDetail:
+    settlement_id: str
+    settlement_date: str
+    generated_at: datetime
+    is_recalculation: bool = False
+
+    valley_active_charge_kwh: float = 0.0
+    valley_passive_charge_kwh: float = 0.0
+    peak_discharge_kwh: float = 0.0
+
+    valley_charge_price: float = 0.0
+    peak_discharge_price: float = 0.0
+
+    theoretical_revenue: float = 0.0
+    efficiency_loss_cost: float = 0.0
+    net_revenue: float = 0.0
+
+    theoretical_max_net_revenue: float = 0.0
+    execution_rate: float = 0.0
+
+    interruptions: List[ArbitrageInterruptionRecord] = field(default_factory=list)
+    interruption_count: int = 0
+    total_lost_revenue: float = 0.0
+
+    valley_hours_count: int = 0
+    peak_hours_count: int = 0
+
+    baseline_savings: float = 0.0
+    notes: List[str] = field(default_factory=list)
+
+    charge_efficiency: float = 0.0
+    discharge_efficiency: float = 0.0
+    battery_capacity_kwh: float = 0.0
+    max_charge_power_kw: float = 0.0
+    max_discharge_power_kw: float = 0.0
+
+
+@dataclass
+class ArbitrageSettlementSummary:
+    start_date: str
+    end_date: str
+    settlement_count: int
+    total_net_revenue: float = 0.0
+    total_theoretical_revenue: float = 0.0
+    total_efficiency_loss_cost: float = 0.0
+    avg_execution_rate: float = 0.0
+    total_interruptions: int = 0
+    total_lost_revenue: float = 0.0
+    total_valley_active_charge_kwh: float = 0.0
+    total_valley_passive_charge_kwh: float = 0.0
+    total_peak_discharge_kwh: float = 0.0
+    total_baseline_savings: float = 0.0
+    low_execution_rate_days: int = 0
+    high_execution_rate_days: int = 0
+
+
+@dataclass
+class ArbitrageTrendPoint:
+    date: str
+    net_revenue: float
+    execution_rate: float
+    theoretical_revenue: float
+    interruption_count: int
+    valley_charge_kwh: float
+    peak_discharge_kwh: float
+
+
+@dataclass
+class ArbitrageAlert:
+    alert_id: str
+    timestamp: datetime
+    alert_type: str
+    alert_level: str
+    message: str
+    details: Dict[str, Any] = field(default_factory=dict)
+    acknowledged: bool = False
+    acknowledged_at: Optional[datetime] = None
+    acknowledged_by: Optional[str] = None
+
+
+@dataclass
+class ArbitrageHourlyRecord:
+    timestamp: datetime
+    hour: int
+    tariff_period: str
+    planned_mode: str
+    actual_charge_kw: float = 0.0
+    actual_discharge_kw: float = 0.0
+    charge_from_grid_kw: float = 0.0
+    charge_from_renewable_kw: float = 0.0
+    is_active_arbitrage: bool = False
+    interrupted: bool = False
+    interruption_reason: str = ""
+    time_interval_hours: float = 0.0
+    grid_buy_price: float = 0.0
+    soc_before: float = 0.0
+    soc_after: float = 0.0
