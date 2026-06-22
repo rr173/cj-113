@@ -96,6 +96,22 @@ class DayAheadDispatchEngine:
 
         return max(soc_min, min(soc_max, soc))
 
+    def _get_future_max_price(self, start_hour: int, end_hour: int = 24) -> float:
+        max_price = 0.0
+        for h in range(start_hour, end_hour):
+            _, price = self._get_grid_price_for_hour(h)
+            if price > max_price:
+                max_price = price
+        return max_price
+
+    def _get_past_min_price(self, start_hour: int, end_hour: int = 0) -> float:
+        min_price = float('inf')
+        for h in range(end_hour, start_hour):
+            _, price = self._get_grid_price_for_hour(h)
+            if price < min_price:
+                min_price = price
+        return min_price
+
     def _optimize_hour_dispatch(
         self,
         hour: int,
@@ -105,6 +121,7 @@ class DayAheadDispatchEngine:
         soc_start: float,
         prev_diesel_running: bool,
         diesel_consecutive_hours: int,
+        future_max_price: Optional[float] = None,
     ) -> Tuple[HourlyDispatchPlan, bool, int]:
         bess_cfg = self._get_bess_config()
         diesel_cfg = self._get_diesel_config()
@@ -135,8 +152,17 @@ class DayAheadDispatchEngine:
         is_valley = period == "valley"
         is_peak = period == "peak"
 
+        if future_max_price is None:
+            future_max_price = self._get_future_max_price(hour + 1)
+
+        has_higher_price_future = future_max_price > grid_price
+        has_much_higher_price_future = future_max_price > grid_price * 1.2
+
         if is_valley:
-            notes.append("谷时段：优先利用低价电充电")
+            if has_higher_price_future:
+                notes.append("谷时段：后面有高价时段，尽量充满电池")
+            else:
+                notes.append("谷时段：优先利用低价电充电")
             charge_energy_needed = (soc_max - soc_start) * capacity
             max_charge_by_soc = charge_energy_needed / bess_cfg["charge_efficiency"]
             target_charge = min(max_charge, max_charge_by_soc)
@@ -192,41 +218,56 @@ class DayAheadDispatchEngine:
                     notes.append(f"峰时购电 {planned_grid_import:.1f}kW")
 
         else:
-            notes.append("平时段：平衡充放电")
-            if total_renewable >= forecast_load:
-                surplus = total_renewable - forecast_load
-                if soc_start < soc_max:
-                    charge_energy_needed = (soc_max - soc_start) * capacity
-                    max_charge_by_soc = charge_energy_needed / bess_cfg["charge_efficiency"]
-                    planned_charge = min(max_charge, max_charge_by_soc, surplus)
-                    if planned_charge > 0.01:
-                        notes.append(f"利用新能源盈余充电 {planned_charge:.1f}kW")
+            if has_much_higher_price_future:
+                notes.append("平时段：后面有峰时段，保留电量不放电")
+                if total_renewable >= forecast_load:
+                    surplus = total_renewable - forecast_load
+                    if soc_start < soc_max:
+                        charge_energy_needed = (soc_max - soc_start) * capacity
+                        max_charge_by_soc = charge_energy_needed / bess_cfg["charge_efficiency"]
+                        planned_charge = min(max_charge, max_charge_by_soc, surplus)
+                        if planned_charge > 0.01:
+                            notes.append(f"利用新能源盈余充电 {planned_charge:.1f}kW，为峰时段储备")
+                else:
+                    net_load = forecast_load - total_renewable
+                    planned_grid_import = net_load
+                    notes.append(f"购电 {planned_grid_import:.1f}kW，保留电池电量")
             else:
-                net_load = forecast_load - total_renewable
-                if soc_start > (soc_min + soc_max) / 2:
-                    discharge_energy_available = (soc_start - soc_min) * capacity * bess_cfg["discharge_efficiency"]
-                    max_discharge_by_soc = discharge_energy_available
-                    planned_discharge = min(max_discharge, max_discharge_by_soc, net_load)
-                    if planned_discharge > 0.01:
-                        net_load -= planned_discharge
-                        notes.append(f"电池放电 {planned_discharge:.1f}kW")
-
-                if net_load > 0.01:
-                    if prev_diesel_running and diesel_consecutive_hours < min_runtime_hours:
-                        diesel_needed = min(diesel_rated, net_load)
-                        planned_diesel = diesel_needed
-                        net_load -= diesel_needed
-                        notes.append(f"柴油机继续运行发电 {planned_diesel:.1f}kW（满足最小运行时间）")
-                    elif diesel_gen_cost < grid_price and net_load * grid_price > diesel_startup_cost:
-                        planned_diesel = min(diesel_rated, net_load)
-                        diesel_startup = True
-                        diesel_running = True
-                        net_load -= planned_diesel
-                        notes.append(f"启动柴油机发电 {planned_diesel:.1f}kW")
+                notes.append("平时段：后面无更高价时段，平衡充放电")
+                if total_renewable >= forecast_load:
+                    surplus = total_renewable - forecast_load
+                    if soc_start < soc_max:
+                        charge_energy_needed = (soc_max - soc_start) * capacity
+                        max_charge_by_soc = charge_energy_needed / bess_cfg["charge_efficiency"]
+                        planned_charge = min(max_charge, max_charge_by_soc, surplus)
+                        if planned_charge > 0.01:
+                            notes.append(f"利用新能源盈余充电 {planned_charge:.1f}kW")
+                else:
+                    net_load = forecast_load - total_renewable
+                    if soc_start > soc_min + 0.1:
+                        discharge_energy_available = (soc_start - soc_min) * capacity * bess_cfg["discharge_efficiency"]
+                        max_discharge_by_soc = discharge_energy_available
+                        planned_discharge = min(max_discharge, max_discharge_by_soc, net_load)
+                        if planned_discharge > 0.01:
+                            net_load -= planned_discharge
+                            notes.append(f"电池放电 {planned_discharge:.1f}kW")
 
                     if net_load > 0.01:
-                        planned_grid_import = net_load
-                        notes.append(f"购电 {planned_grid_import:.1f}kW")
+                        if prev_diesel_running and diesel_consecutive_hours < min_runtime_hours:
+                            diesel_needed = min(diesel_rated, net_load)
+                            planned_diesel = diesel_needed
+                            net_load -= diesel_needed
+                            notes.append(f"柴油机继续运行发电 {planned_diesel:.1f}kW（满足最小运行时间）")
+                        elif diesel_gen_cost < grid_price and net_load * grid_price > diesel_startup_cost:
+                            planned_diesel = min(diesel_rated, net_load)
+                            diesel_startup = True
+                            diesel_running = True
+                            net_load -= planned_diesel
+                            notes.append(f"启动柴油机发电 {planned_diesel:.1f}kW")
+
+                        if net_load > 0.01:
+                            planned_grid_import = net_load
+                            notes.append(f"购电 {planned_grid_import:.1f}kW")
 
         if diesel_running and not prev_diesel_running:
             diesel_consecutive_hours = 1
@@ -323,6 +364,8 @@ class DayAheadDispatchEngine:
             if forecast_hour is None:
                 raise ValueError(f"缺少小时 {hour} 的预测数据")
 
+            future_max_price = self._get_future_max_price(hour + 1, end_hour)
+
             plan_hour, diesel_running, diesel_consecutive_hours = self._optimize_hour_dispatch(
                 hour=hour,
                 forecast_load=forecast_hour.forecast_load_kw,
@@ -331,6 +374,7 @@ class DayAheadDispatchEngine:
                 soc_start=current_soc,
                 prev_diesel_running=diesel_running,
                 diesel_consecutive_hours=diesel_consecutive_hours,
+                future_max_price=future_max_price,
             )
 
             hours[hour] = plan_hour
