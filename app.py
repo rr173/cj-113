@@ -3337,6 +3337,510 @@ def _list_endpoints():
         "POST /api/maintenance/check - 手动触发维保计划状态检查（调试用）",
     ]
 
+def _hourly_plan_to_dict(hp):
+    return {
+        "hour": hp.hour,
+        "forecast_load_kw": hp.forecast_load_kw,
+        "forecast_pv_kw": hp.forecast_pv_kw,
+        "forecast_wt_kw": hp.forecast_wt_kw,
+        "tariff_period": hp.tariff_period,
+        "tariff_period_chinese": {"valley": "谷时段", "flat": "平时段", "peak": "峰时段"}.get(hp.tariff_period, "未知"),
+        "grid_buy_price": hp.grid_buy_price,
+        "planned_charge_kw": hp.planned_charge_kw,
+        "planned_discharge_kw": hp.planned_discharge_kw,
+        "planned_grid_import_kw": hp.planned_grid_import_kw,
+        "planned_diesel_kw": hp.planned_diesel_kw,
+        "planned_cost": hp.planned_cost,
+        "soc_start": hp.soc_start,
+        "soc_start_percent": round(hp.soc_start * 100, 2),
+        "soc_end": hp.soc_end,
+        "soc_end_percent": round(hp.soc_end * 100, 2),
+        "diesel_running": hp.diesel_running,
+        "notes": hp.notes,
+        "actual_data": hp.actual_data,
+        "deviation": hp.deviation,
+    }
+
+
+def _plan_to_dict(plan):
+    hours_list = []
+    for h in range(24):
+        if h in plan.hours:
+            hours_list.append(_hourly_plan_to_dict(plan.hours[h]))
+
+    total_charge = sum(h.planned_charge_kw for h in plan.hours.values())
+    total_discharge = sum(h.planned_discharge_kw for h in plan.hours.values())
+    total_grid = sum(h.planned_grid_import_kw for h in plan.hours.values())
+    total_diesel = sum(h.planned_diesel_kw for h in plan.hours.values())
+
+    valley_hours = [h for h in plan.hours.values() if h.tariff_period == "valley"]
+    peak_hours = [h for h in plan.hours.values() if h.tariff_period == "peak"]
+    flat_hours = [h for h in plan.hours.values() if h.tariff_period == "flat"]
+
+    return {
+        "plan_id": plan.plan_id,
+        "plan_date": plan.plan_date,
+        "generated_at": plan.generated_at.isoformat(),
+        "forecast_id": plan.forecast_id,
+        "initial_soc": plan.initial_soc,
+        "initial_soc_percent": round(plan.initial_soc * 100, 2),
+        "total_planned_cost": plan.total_planned_cost,
+        "version": plan.version,
+        "parent_plan_id": plan.parent_plan_id,
+        "generated_by": plan.generated_by,
+        "generated_by_chinese": {"auto": "自动生成", "manual": "手动生成"}.get(plan.generated_by, plan.generated_by),
+        "note": plan.note,
+        "is_active": plan.is_active,
+        "activated_at": plan.activated_at.isoformat() if plan.activated_at else None,
+        "actual_total_cost": plan.actual_total_cost,
+        "completed": plan.completed,
+        "summary": {
+            "total_planned_charge_kwh": round(total_charge, 4),
+            "total_planned_discharge_kwh": round(total_discharge, 4),
+            "total_planned_grid_import_kwh": round(total_grid, 4),
+            "total_planned_diesel_kwh": round(total_diesel, 4),
+            "valley_hour_count": len(valley_hours),
+            "peak_hour_count": len(peak_hours),
+            "flat_hour_count": len(flat_hours),
+            "valley_total_grid_import_kwh": round(sum(h.planned_grid_import_kw for h in valley_hours), 4),
+            "peak_total_grid_import_kwh": round(sum(h.planned_grid_import_kw for h in peak_hours), 4),
+            "flat_total_grid_import_kwh": round(sum(h.planned_grid_import_kw for h in flat_hours), 4),
+            "valley_avg_grid_import_kw": round(sum(h.planned_grid_import_kw for h in valley_hours) / max(len(valley_hours), 1), 4),
+            "peak_avg_grid_import_kw": round(sum(h.planned_grid_import_kw for h in peak_hours) / max(len(peak_hours), 1), 4),
+        },
+        "hours": hours_list,
+    }
+
+
+@app.route("/api/day-ahead/forecast", methods=["POST"])
+def submit_day_ahead_forecast():
+    """
+    提交次日预测并生成经济调度计划
+    请求体: {
+        "forecast_date": "2024-06-22",
+        "initial_soc": 0.5,  (可选，默认使用当前电池SOC)
+        "hours": [
+            {
+                "hour": 0,
+                "forecast_load_kw": 150.0,
+                "forecast_pv_kw": 0.0,
+                "forecast_wt_kw": 20.0
+            },
+            ...  (共24小时数据)
+        ]
+    }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+
+        if "forecast_date" not in data:
+            return jsonify({"error": "缺少必填字段: forecast_date"}), 400
+        if "hours" not in data or not isinstance(data["hours"], list):
+            return jsonify({"error": "缺少必填字段: hours (数组形式，共24小时)"}), 400
+
+        forecast_date = data["forecast_date"]
+        hours_data = data["hours"]
+        initial_soc = data.get("initial_soc")
+        if initial_soc is not None:
+            initial_soc = float(initial_soc)
+
+        result = state.submit_day_ahead_forecast(
+            forecast_date=forecast_date,
+            hours_data=hours_data,
+            initial_soc=initial_soc,
+        )
+
+        if not result["success"]:
+            return jsonify({"error": result.get("error", "生成计划失败")}), 400
+
+        plan = state.get_day_ahead_plan(result["plan_id"])
+
+        return jsonify({
+            "status": "ok",
+            "message": "日前经济调度计划生成成功",
+            "forecast_id": result["forecast_id"],
+            "plan_id": result["plan_id"],
+            "plan_date": result["plan_date"],
+            "total_planned_cost": result["total_planned_cost"],
+            "initial_soc": result["initial_soc"],
+            "initial_soc_percent": round(result["initial_soc"] * 100, 2),
+            "version": result["version"],
+            "replaced_plan_id": result.get("replaced_plan_id"),
+            "plan": _plan_to_dict(plan) if plan else None,
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/day-ahead/plan/active", methods=["GET"])
+def get_active_day_ahead_plan():
+    """
+    查询当前生效的日前计划（整天24时段明细）
+    """
+    plan = state.get_active_day_ahead_plan()
+    if plan is None:
+        return jsonify({
+            "status": "ok",
+            "plan_exists": False,
+            "message": "当前无生效的日前计划",
+            "plan": None,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "plan_exists": True,
+        "plan": _plan_to_dict(plan),
+    })
+
+
+@app.route("/api/day-ahead/plan/<plan_id>", methods=["GET"])
+def get_day_ahead_plan_detail(plan_id):
+    """
+    查询指定计划的详情（整天24时段明细）
+    """
+    plan = state.get_day_ahead_plan(plan_id)
+    if plan is None:
+        return jsonify({"error": f"未找到计划: {plan_id}"}), 404
+
+    return jsonify({
+        "status": "ok",
+        "plan": _plan_to_dict(plan),
+    })
+
+
+@app.route("/api/day-ahead/plan/<plan_id>/hour/<int:hour>", methods=["GET"])
+def get_day_ahead_plan_hour(plan_id, hour):
+    """
+    查询某时段的计划详情
+    参数: hour (0-23)
+    """
+    if not (0 <= hour <= 23):
+        return jsonify({"error": "hour 必须在 0-23 之间"}), 400
+
+    plan_hour = state.get_day_ahead_plan_hour(plan_id, hour)
+    if plan_hour is None:
+        return jsonify({"error": f"未找到计划 {plan_id} 的时段 {hour} 数据"}), 404
+
+    return jsonify({
+        "status": "ok",
+        "plan_id": plan_id,
+        "hour": hour,
+        "plan": _hourly_plan_to_dict(plan_hour),
+    })
+
+
+@app.route("/api/day-ahead/plans", methods=["GET"])
+def list_day_ahead_plans():
+    """
+    查询日前计划列表
+    参数: plan_date (可选，按日期筛选，格式 YYYY-MM-DD)
+    """
+    plan_date = request.args.get("plan_date")
+    plans = state.list_day_ahead_plans(plan_date)
+
+    result = []
+    for plan in plans:
+        result.append({
+            "plan_id": plan.plan_id,
+            "plan_date": plan.plan_date,
+            "generated_at": plan.generated_at.isoformat(),
+            "total_planned_cost": plan.total_planned_cost,
+            "version": plan.version,
+            "is_active": plan.is_active,
+            "completed": plan.completed,
+            "generated_by": plan.generated_by,
+            "generated_by_chinese": {"auto": "自动生成", "manual": "手动生成"}.get(plan.generated_by, plan.generated_by),
+            "note": plan.note,
+            "parent_plan_id": plan.parent_plan_id,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "total": len(result),
+        "plan_date": plan_date,
+        "plans": result,
+    })
+
+
+@app.route("/api/day-ahead/forecasts", methods=["GET"])
+def list_day_ahead_forecasts():
+    """
+    查询预测数据列表
+    参数: forecast_date (可选，按日期筛选，格式 YYYY-MM-DD)
+    """
+    forecast_date = request.args.get("forecast_date")
+    forecasts = state.list_day_ahead_forecasts(forecast_date)
+
+    result = []
+    for fc in forecasts:
+        hours_summary = []
+        for fh in fc.hours:
+            hours_summary.append({
+                "hour": fh.hour,
+                "forecast_load_kw": fh.forecast_load_kw,
+                "forecast_pv_kw": fh.forecast_pv_kw,
+                "forecast_wt_kw": fh.forecast_wt_kw,
+            })
+        result.append({
+            "forecast_id": fc.forecast_id,
+            "forecast_date": fc.forecast_date,
+            "submitted_at": fc.submitted_at.isoformat(),
+            "initial_soc": fc.initial_soc,
+            "status": fc.status,
+            "activated_at": fc.activated_at.isoformat() if fc.activated_at else None,
+            "hours": hours_summary,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "total": len(result),
+        "forecast_date": forecast_date,
+        "forecasts": result,
+    })
+
+
+@app.route("/api/day-ahead/plan/<plan_id>/actual-data", methods=["POST"])
+def submit_hourly_actual_data(plan_id):
+    """
+    提交时段实际运行数据，自动检测偏差并触发滚动校正
+    请求体: {
+        "hour": 10,
+        "actual_load_kw": 200.0,
+        "actual_pv_kw": 80.0,
+        "actual_wt_kw": 15.0,
+        "actual_charge_kw": 0.0,
+        "actual_discharge_kw": 50.0,
+        "actual_grid_import_kw": 55.0,
+        "actual_diesel_kw": 0.0,
+        "actual_cost": 66.0,
+        "soc_end": 0.45
+    }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+
+        if "hour" not in data:
+            return jsonify({"error": "缺少必填字段: hour"}), 400
+
+        hour = int(data["hour"])
+        if not (0 <= hour <= 23):
+            return jsonify({"error": "hour 必须在 0-23 之间"}), 400
+
+        result = state.submit_hourly_actual_data(
+            plan_id=plan_id,
+            hour=hour,
+            actual_data=data,
+        )
+
+        if not result["success"]:
+            return jsonify({"error": result.get("error", "提交实际数据失败")}), 400
+
+        response = {
+            "status": "ok",
+            "message": "实际数据已提交",
+            "hour": result["hour"],
+            "plan_id": result["plan_id"],
+            "deviation_detected": result["deviation_detected"],
+        }
+
+        if "correction" in result:
+            response["correction"] = result["correction"]
+            response["new_plan"] = result["new_plan"]
+
+        return jsonify(response)
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/day-ahead/corrections", methods=["GET"])
+def get_correction_events():
+    """
+    查询校正事件历史
+    参数:
+      - plan_id: 可选，按计划筛选
+      - limit: 可选，返回数量限制，默认100
+    """
+    try:
+        plan_id = request.args.get("plan_id")
+        limit = int(request.args.get("limit", 100))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+
+    events = state.get_correction_events(plan_id=plan_id, limit=limit)
+
+    result = []
+    for event in events:
+        result.append({
+            "event_id": event.event_id,
+            "plan_id": event.plan_id,
+            "triggered_at": event.triggered_at.isoformat(),
+            "triggered_by_hour": event.triggered_by_hour,
+            "trigger_reason": event.trigger_reason,
+            "deviation_details": event.deviation_details,
+            "old_plan_id": event.old_plan_id,
+            "new_plan_id": event.new_plan_id,
+            "corrected_hours": event.corrected_hours,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "total": len(result),
+        "plan_id": plan_id,
+        "limit": limit,
+        "corrections": result,
+    })
+
+
+@app.route("/api/day-ahead/plan/<plan_id>/evaluate", methods=["POST"])
+def generate_plan_evaluation(plan_id):
+    """
+    生成并查询计划执行评估报告
+    对比计划执行情况：计划总成本vs实际总成本、各时段偏差、触发了几次滚动校正、预测准确度
+    """
+    result = state.generate_plan_evaluation_report(plan_id)
+
+    if not result["success"]:
+        return jsonify({"error": result.get("error", "生成评估报告失败")}), 400
+
+    return jsonify({
+        "status": "ok",
+        "message": "计划执行评估报告生成成功",
+        "report": {
+            "report_id": result["report_id"],
+            "plan_id": result["plan_id"],
+            "plan_date": result["plan_date"],
+            "generated_at": datetime.now().isoformat(),
+            "total_planned_cost": result["total_planned_cost"],
+            "total_actual_cost": result["total_actual_cost"],
+            "cost_deviation_percent": result["cost_deviation_percent"],
+            "avg_load_forecast_error_percent": result["avg_load_forecast_error_percent"],
+            "correction_count": result["correction_count"],
+            "correction_events": result["correction_events"],
+            "hourly_deviations": result["hourly_deviations"],
+            "details": result["details"],
+        },
+    })
+
+
+@app.route("/api/day-ahead/evaluations", methods=["GET"])
+def list_evaluation_reports():
+    """
+    查询评估报告列表
+    参数: plan_id (可选，按计划筛选)
+    """
+    plan_id = request.args.get("plan_id")
+    reports = state.list_evaluation_reports(plan_id)
+
+    result = []
+    for report in reports:
+        result.append({
+            "report_id": report.report_id,
+            "plan_id": report.plan_id,
+            "plan_date": report.plan_date,
+            "generated_at": report.generated_at.isoformat(),
+            "total_planned_cost": report.total_planned_cost,
+            "total_actual_cost": report.total_actual_cost,
+            "cost_deviation_percent": report.cost_deviation_percent,
+            "avg_load_forecast_error_percent": report.avg_load_forecast_error_percent,
+            "correction_count": report.correction_count,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "total": len(result),
+        "plan_id": plan_id,
+        "reports": result,
+    })
+
+
+@app.route("/api/day-ahead/plan/<plan_id>/regenerate", methods=["POST"])
+def regenerate_day_ahead_plan(plan_id):
+    """
+    手动重新生成计划
+    请求体: {
+        "start_hour": 0,  (可选，默认0，从指定时段开始重算)
+        "initial_soc": 0.5  (可选，默认使用计划中start_hour的起始SOC)
+    }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        start_hour = int(data.get("start_hour", 0))
+        initial_soc = data.get("initial_soc")
+        if initial_soc is not None:
+            initial_soc = float(initial_soc)
+
+        if not (0 <= start_hour <= 23):
+            return jsonify({"error": "start_hour 必须在 0-23 之间"}), 400
+
+        result = state.regenerate_day_ahead_plan(
+            plan_id=plan_id,
+            start_hour=start_hour,
+            initial_soc=initial_soc,
+        )
+
+        if not result["success"]:
+            return jsonify({"error": result.get("error", "重新生成计划失败")}), 400
+
+        new_plan = state.get_day_ahead_plan(result["new_plan_id"])
+
+        return jsonify({
+            "status": "ok",
+            "message": "计划已手动重新生成",
+            "old_plan_id": result["old_plan_id"],
+            "new_plan_id": result["new_plan_id"],
+            "new_plan_version": result["new_plan_version"],
+            "start_hour": result["start_hour"],
+            "initial_soc": result["initial_soc"],
+            "initial_soc_percent": round(result["initial_soc"] * 100, 2),
+            "total_planned_cost": result["total_planned_cost"],
+            "note": result["note"],
+            "became_active": result["became_active"],
+            "new_plan": _plan_to_dict(new_plan) if new_plan else None,
+        })
+    except ValueError as e:
+        return jsonify({"error": f"参数错误: {str(e)}"}), 400
+
+
+@app.route("/api/day-ahead/forecast/<forecast_id>", methods=["GET"])
+def get_day_ahead_forecast_detail(forecast_id):
+    """
+    查询指定预测数据的详情
+    """
+    forecast = state.get_day_ahead_forecast(forecast_id)
+    if forecast is None:
+        return jsonify({"error": f"未找到预测数据: {forecast_id}"}), 404
+
+    hours = []
+    for fh in forecast.hours:
+        period, price = config.get_grid_price_for_hour(fh.hour) if hasattr(config, 'get_grid_price_for_hour') else config.get_tariff_period(fh.hour), config.GRID_TARIFF[config.get_tariff_period(fh.hour)]["price"]
+        if isinstance(period, tuple):
+            period, price = period[0], config.GRID_TARIFF[period]["price"]
+        hours.append({
+            "hour": fh.hour,
+            "forecast_load_kw": fh.forecast_load_kw,
+            "forecast_pv_kw": fh.forecast_pv_kw,
+            "forecast_wt_kw": fh.forecast_wt_kw,
+            "total_renewable_kw": fh.forecast_pv_kw + fh.forecast_wt_kw,
+            "net_load_kw": max(0.0, fh.forecast_load_kw - fh.forecast_pv_kw - fh.forecast_wt_kw),
+            "tariff_period": config.get_tariff_period(fh.hour),
+            "tariff_period_chinese": {"valley": "谷时段", "flat": "平时段", "peak": "峰时段"}.get(config.get_tariff_period(fh.hour), "未知"),
+            "grid_buy_price": config.GRID_TARIFF[config.get_tariff_period(fh.hour)]["price"],
+        })
+
+    return jsonify({
+        "status": "ok",
+        "forecast": {
+            "forecast_id": forecast.forecast_id,
+            "forecast_date": forecast.forecast_date,
+            "submitted_at": forecast.submitted_at.isoformat(),
+            "initial_soc": forecast.initial_soc,
+            "initial_soc_percent": round(forecast.initial_soc * 100, 2),
+            "status": forecast.status,
+            "activated_at": forecast.activated_at.isoformat() if forecast.activated_at else None,
+            "hours": hours,
+        },
+    })
+
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -3352,5 +3856,6 @@ if __name__ == "__main__":
     print("健康检查: http://127.0.0.1:5001/api/health")
     print("审计日志: http://127.0.0.1:5001/api/audit/logs")
     print("异常检测: http://127.0.0.1:5001/api/audit/anomalies")
+    print("日前计划: http://127.0.0.1:5001/api/day-ahead/plan/active")
     print("=" * 60)
     app.run(host="0.0.0.0", port=5001, debug=False)

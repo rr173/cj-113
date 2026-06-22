@@ -873,6 +873,15 @@ class MicrogridState:
         self._active_maintenance_restrictions: Dict[str, MaintenanceRestriction] = {}
         self._bess_original_soc_limits: Dict[str, Dict[str, float]] = {}
 
+        from day_ahead_engine import DayAheadDispatchEngine
+        self.day_ahead_engine = DayAheadDispatchEngine(self)
+        self.day_ahead_forecasts: Dict[str, DayAheadForecast] = {}
+        self.day_ahead_plans: Dict[str, DayAheadPlan] = {}
+        self.active_day_ahead_plan: Optional[DayAheadPlan] = None
+        self.correction_events: List[CorrectionEvent] = []
+        self.plan_evaluation_reports: Dict[str, PlanEvaluationReport] = {}
+        self._hourly_actual_data: Dict[str, Dict[int, HourlyActualData]] = {}
+
     def _init_carbon_manager(self):
         from carbon_manager import CarbonManager
         self.carbon_manager = CarbonManager(self)
@@ -3105,6 +3114,282 @@ class MicrogridState:
         key = f"{device_type}:{device_id}"
         return self._active_maintenance_restrictions.get(key)
 
+    def submit_day_ahead_forecast(
+        self,
+        forecast_date: str,
+        hours_data: List[Dict[str, Any]],
+        initial_soc: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if initial_soc is None:
+            initial_soc = self.bess_state[list(config.BESS_CONFIG.keys())[0]].soc
+
+        forecast = self.day_ahead_engine.create_forecast(
+            forecast_date=forecast_date,
+            hours_data=hours_data,
+            initial_soc=initial_soc,
+        )
+        self.day_ahead_forecasts[forecast.forecast_id] = forecast
+
+        plan = self.day_ahead_engine.generate_plan(forecast, initial_soc=initial_soc)
+        self.day_ahead_plans[plan.plan_id] = plan
+
+        if self.active_day_ahead_plan and self.active_day_ahead_plan.plan_date == forecast_date:
+            old_plan_id = self.active_day_ahead_plan.plan_id
+        else:
+            old_plan_id = None
+
+        plan.is_active = True
+        plan.activated_at = datetime.now()
+        forecast.status = "active"
+        forecast.activated_at = datetime.now()
+        self.active_day_ahead_plan = plan
+
+        return {
+            "success": True,
+            "forecast_id": forecast.forecast_id,
+            "plan_id": plan.plan_id,
+            "plan_date": plan.plan_date,
+            "total_planned_cost": plan.total_planned_cost,
+            "initial_soc": initial_soc,
+            "version": plan.version,
+            "replaced_plan_id": old_plan_id,
+        }
+
+    def get_active_day_ahead_plan(self) -> Optional[DayAheadPlan]:
+        return self.active_day_ahead_plan
+
+    def get_day_ahead_plan(self, plan_id: str) -> Optional[DayAheadPlan]:
+        return self.day_ahead_plans.get(plan_id)
+
+    def get_day_ahead_plan_hour(self, plan_id: str, hour: int) -> Optional[HourlyDispatchPlan]:
+        plan = self.day_ahead_plans.get(plan_id)
+        if plan is None:
+            return None
+        return plan.hours.get(hour)
+
+    def get_day_ahead_forecast(self, forecast_id: str) -> Optional[DayAheadForecast]:
+        return self.day_ahead_forecasts.get(forecast_id)
+
+    def list_day_ahead_plans(self, plan_date: Optional[str] = None) -> List[DayAheadPlan]:
+        plans = list(self.day_ahead_plans.values())
+        if plan_date:
+            plans = [p for p in plans if p.plan_date == plan_date]
+        plans.sort(key=lambda p: p.generated_at, reverse=True)
+        return plans
+
+    def list_day_ahead_forecasts(self, forecast_date: Optional[str] = None) -> List[DayAheadForecast]:
+        forecasts = list(self.day_ahead_forecasts.values())
+        if forecast_date:
+            forecasts = [f for f in forecasts if f.forecast_date == forecast_date]
+        forecasts.sort(key=lambda f: f.submitted_at, reverse=True)
+        return forecasts
+
+    def submit_hourly_actual_data(
+        self,
+        plan_id: str,
+        hour: int,
+        actual_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        plan = self.day_ahead_plans.get(plan_id)
+        if plan is None:
+            return {"success": False, "error": f"未找到计划: {plan_id}"}
+
+        forecast = self.day_ahead_forecasts.get(plan.forecast_id)
+        if forecast is None:
+            return {"success": False, "error": f"未找到关联的预测数据"}
+
+        required_fields = [
+            "actual_load_kw", "actual_pv_kw", "actual_wt_kw",
+            "actual_charge_kw", "actual_discharge_kw",
+            "actual_grid_import_kw", "actual_diesel_kw",
+            "actual_cost", "soc_end",
+        ]
+        for field in required_fields:
+            if field not in actual_data:
+                return {"success": False, "error": f"缺少必填字段: {field}"}
+
+        hourly_data = HourlyActualData(
+            hour=hour,
+            actual_load_kw=float(actual_data["actual_load_kw"]),
+            actual_pv_kw=float(actual_data["actual_pv_kw"]),
+            actual_wt_kw=float(actual_data["actual_wt_kw"]),
+            actual_charge_kw=float(actual_data["actual_charge_kw"]),
+            actual_discharge_kw=float(actual_data["actual_discharge_kw"]),
+            actual_grid_import_kw=float(actual_data["actual_grid_import_kw"]),
+            actual_diesel_kw=float(actual_data["actual_diesel_kw"]),
+            actual_cost=float(actual_data["actual_cost"]),
+            soc_end=float(actual_data["soc_end"]),
+            timestamp=datetime.now(),
+        )
+
+        if plan_id not in self._hourly_actual_data:
+            self._hourly_actual_data[plan_id] = {}
+        self._hourly_actual_data[plan_id][hour] = hourly_data
+
+        success = self.day_ahead_engine.record_actual_data(plan, hourly_data)
+        if not success:
+            return {"success": False, "error": f"记录实际数据失败，小时 {hour} 不在计划中"}
+
+        correction_event, new_plan = self.day_ahead_engine.check_deviation_and_correct(
+            plan, hourly_data, forecast
+        )
+
+        result = {
+            "success": True,
+            "hour": hour,
+            "plan_id": plan_id,
+            "deviation_detected": correction_event is not None,
+        }
+
+        if correction_event and new_plan:
+            self.correction_events.append(correction_event)
+            self.day_ahead_plans[new_plan.plan_id] = new_plan
+
+            if self.active_day_ahead_plan and self.active_day_ahead_plan.plan_id == plan_id:
+                new_plan.is_active = True
+                new_plan.activated_at = datetime.now()
+                self.active_day_ahead_plan = new_plan
+
+            result["correction"] = {
+                "event_id": correction_event.event_id,
+                "trigger_reason": correction_event.trigger_reason,
+                "triggered_by_hour": correction_event.triggered_by_hour,
+                "new_plan_id": new_plan.plan_id,
+                "new_plan_version": new_plan.version,
+                "corrected_hours": correction_event.corrected_hours,
+                "deviation_details": correction_event.deviation_details,
+            }
+            result["new_plan"] = {
+                "plan_id": new_plan.plan_id,
+                "version": new_plan.version,
+                "total_planned_cost": new_plan.total_planned_cost,
+                "note": new_plan.note,
+            }
+
+            self.add_alert(
+                "DAY_AHEAD_CORRECTION",
+                f"日前计划滚动校正：时段{hour}触发，{correction_event.trigger_reason}",
+                {
+                    "plan_id": plan_id,
+                    "hour": hour,
+                    "correction_event_id": correction_event.event_id,
+                    "new_plan_id": new_plan.plan_id,
+                    "deviation": correction_event.deviation_details,
+                },
+            )
+
+        if hour == 23:
+            plan.completed = True
+            all_hours = [h for h in plan.hours.values() if h.actual_data is not None]
+            if len(all_hours) == 24:
+                plan.actual_total_cost = sum(h.actual_data["actual_cost"] for h in all_hours)
+
+        return result
+
+    def regenerate_day_ahead_plan(
+        self,
+        plan_id: str,
+        start_hour: int = 0,
+        initial_soc: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        old_plan = self.day_ahead_plans.get(plan_id)
+        if old_plan is None:
+            return {"success": False, "error": f"未找到计划: {plan_id}"}
+
+        forecast = self.day_ahead_forecasts.get(old_plan.forecast_id)
+        if forecast is None:
+            return {"success": False, "error": f"未找到关联的预测数据"}
+
+        if initial_soc is None:
+            if start_hour > 0 and start_hour in old_plan.hours:
+                initial_soc = old_plan.hours[start_hour].soc_start
+            else:
+                initial_soc = old_plan.initial_soc
+
+        try:
+            new_plan = self.day_ahead_engine.generate_plan(
+                forecast=forecast,
+                initial_soc=initial_soc,
+                start_hour=start_hour,
+                end_hour=24,
+                existing_hours=old_plan.hours,
+            )
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        new_plan.version = old_plan.version + 1
+        new_plan.parent_plan_id = old_plan.plan_id
+        new_plan.generated_by = "manual"
+        new_plan.note = f"手动重新生成：从时段{start_hour}开始重算，初始SOC={initial_soc:.3f}"
+
+        self.day_ahead_plans[new_plan.plan_id] = new_plan
+
+        if self.active_day_ahead_plan and self.active_day_ahead_plan.plan_id == plan_id:
+            new_plan.is_active = True
+            new_plan.activated_at = datetime.now()
+            self.active_day_ahead_plan = new_plan
+
+        return {
+            "success": True,
+            "old_plan_id": plan_id,
+            "new_plan_id": new_plan.plan_id,
+            "new_plan_version": new_plan.version,
+            "start_hour": start_hour,
+            "initial_soc": initial_soc,
+            "total_planned_cost": new_plan.total_planned_cost,
+            "note": new_plan.note,
+            "became_active": new_plan.is_active,
+        }
+
+    def get_correction_events(
+        self,
+        plan_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[CorrectionEvent]:
+        events = list(self.correction_events)
+        if plan_id:
+            events = [e for e in events if e.plan_id == plan_id]
+        events.sort(key=lambda e: e.triggered_at, reverse=True)
+        return events[:limit]
+
+    def generate_plan_evaluation_report(
+        self,
+        plan_id: str,
+    ) -> Dict[str, Any]:
+        plan = self.day_ahead_plans.get(plan_id)
+        if plan is None:
+            return {"success": False, "error": f"未找到计划: {plan_id}"}
+
+        correction_events = [e for e in self.correction_events if e.plan_id == plan_id]
+
+        report = self.day_ahead_engine.evaluate_plan(plan, correction_events)
+        self.plan_evaluation_reports[report.report_id] = report
+
+        return {
+            "success": True,
+            "report_id": report.report_id,
+            "plan_id": plan_id,
+            "plan_date": plan.plan_date,
+            "total_planned_cost": report.total_planned_cost,
+            "total_actual_cost": report.total_actual_cost,
+            "cost_deviation_percent": report.cost_deviation_percent,
+            "avg_load_forecast_error_percent": report.avg_load_forecast_error_percent,
+            "correction_count": report.correction_count,
+            "correction_events": report.correction_events,
+            "hourly_deviations": report.hourly_deviations,
+            "details": report.details,
+        }
+
+    def get_evaluation_report(self, report_id: str) -> Optional[PlanEvaluationReport]:
+        return self.plan_evaluation_reports.get(report_id)
+
+    def list_evaluation_reports(self, plan_id: Optional[str] = None) -> List[PlanEvaluationReport]:
+        reports = list(self.plan_evaluation_reports.values())
+        if plan_id:
+            reports = [r for r in reports if r.plan_id == plan_id]
+        reports.sort(key=lambda r: r.generated_at, reverse=True)
+        return reports
+
 
 @dataclass
 class TopExpensiveDispatch:
@@ -3382,3 +3667,106 @@ class ArbitrageHourlyRecord:
     grid_buy_price: float = 0.0
     soc_before: float = 0.0
     soc_after: float = 0.0
+
+
+@dataclass
+class DayAheadForecastHour:
+    hour: int
+    forecast_load_kw: float
+    forecast_pv_kw: float
+    forecast_wt_kw: float
+
+
+@dataclass
+class DayAheadForecast:
+    forecast_id: str
+    forecast_date: str
+    submitted_at: datetime
+    hours: List[DayAheadForecastHour]
+    initial_soc: float = 0.5
+    status: str = "pending"
+    activated_at: Optional[datetime] = None
+
+
+@dataclass
+class HourlyDispatchPlan:
+    hour: int
+    forecast_load_kw: float
+    forecast_pv_kw: float
+    forecast_wt_kw: float
+    tariff_period: str
+    grid_buy_price: float
+    planned_charge_kw: float
+    planned_discharge_kw: float
+    planned_grid_import_kw: float
+    planned_diesel_kw: float
+    planned_cost: float
+    soc_start: float
+    soc_end: float
+    diesel_running: bool = False
+    notes: List[str] = field(default_factory=list)
+    actual_data: Optional[Dict[str, Any]] = None
+    deviation: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class DayAheadPlan:
+    plan_id: str
+    plan_date: str
+    generated_at: datetime
+    forecast_id: str
+    initial_soc: float
+    hours: Dict[int, HourlyDispatchPlan]
+    total_planned_cost: float = 0.0
+    version: int = 1
+    parent_plan_id: Optional[str] = None
+    generated_by: str = "auto"
+    note: str = ""
+    is_active: bool = False
+    activated_at: Optional[datetime] = None
+    actual_total_cost: Optional[float] = None
+    completed: bool = False
+
+
+@dataclass
+class HourlyActualData:
+    hour: int
+    actual_load_kw: float
+    actual_pv_kw: float
+    actual_wt_kw: float
+    actual_charge_kw: float
+    actual_discharge_kw: float
+    actual_grid_import_kw: float
+    actual_diesel_kw: float
+    actual_cost: float
+    soc_end: float
+    timestamp: Optional[datetime] = None
+
+
+@dataclass
+class CorrectionEvent:
+    event_id: str
+    plan_id: str
+    triggered_at: datetime
+    triggered_by_hour: int
+    trigger_reason: str
+    deviation_details: Dict[str, Any]
+    old_plan_id: Optional[str] = None
+    new_plan_id: Optional[str] = None
+    corrected_hours: List[int] = field(default_factory=list)
+
+
+@dataclass
+class PlanEvaluationReport:
+    report_id: str
+    plan_id: str
+    plan_date: str
+    generated_at: datetime
+    total_planned_cost: float
+    total_actual_cost: float
+    cost_deviation_percent: float
+    avg_load_forecast_error_percent: float
+    correction_count: int
+    correction_events: List[str] = field(default_factory=list)
+    hourly_deviations: List[Dict[str, Any]] = field(default_factory=list)
+    details: Dict[str, Any] = field(default_factory=dict)
