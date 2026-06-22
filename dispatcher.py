@@ -6,6 +6,7 @@ from models import MicrogridState, DispatchDecision, AuditLog, StrategyParams
 from demand_response import DemandResponseManager
 from price_forecast import PriceForecastManager
 from audit import AuditBuilder, AnomalyDetector, CostAttributionAnalyzer
+from island_manager import OperationMode
 
 
 class DispatchEngine:
@@ -237,6 +238,22 @@ class DispatchEngine:
                 True,
                 "电价预测触发强制放电，禁止购电",
                 {"hour": now.hour, "grid_buy_price": grid_buy_price}
+            )
+
+        island_mode = self.state.island_manager.mode in (OperationMode.ISLAND, OperationMode.BLACK_START)
+        island_grid_blocked = False
+        if island_mode:
+            island_grid_blocked = True
+            force_discharge = True
+            island_mgr = self.state.island_manager
+            mode_cn = island_mgr.get_mode_name()
+            notes.append(f"[{mode_cn}] 孤岛运行，禁止购电和售电，SOC下限{island_mgr.get_island_soc_min()*100:.0f}%")
+            audit_builder.add_branch(
+                "孤岛模式",
+                True,
+                f"{mode_cn}，禁止购电和售电，SOC下限提升至{island_mgr.get_island_soc_min()*100:.0f}%",
+                {"mode": island_mgr.mode.value, "mode_chinese": mode_cn,
+                 "soc_min": island_mgr.get_island_soc_min()}
             )
 
         current_hour_plan = self.state.get_current_hour_plan(now)
@@ -1499,6 +1516,101 @@ class DispatchEngine:
 
         self.state.finalize_group_state_after_dispatch()
         self.state.record_reliability_snapshot(now)
+
+        if island_grid_blocked:
+            if grid_import_kw > 0.001:
+                island_remaining = grid_import_kw
+                grid_import_kw = 0.0
+                ds_id_island = list(config.DIESEL_CONFIG.keys())[0]
+                diesel_cap = self.state.get_available_diesel_capacity(ds_id_island, now)
+                if diesel_cap["can_run"]:
+                    diesel_available_kw = diesel_cap["max_output"] - diesel_output.get(ds_id_island, 0.0)
+                    diesel_fill = min(island_remaining, diesel_available_kw)
+                    if diesel_fill > 0:
+                        diesel_output[ds_id_island] = diesel_output.get(ds_id_island, 0.0) + diesel_fill
+                        self.state.diesel_state[ds_id_island].output_kw = diesel_output[ds_id_island]
+                        total_cost += diesel_fill * time_interval_hours * diesel_gen_cost
+                        if diesel_cap.get("startup_cost_applies"):
+                            startup_cost = config.DIESEL_CONFIG[ds_id_island]["startup_cost"]
+                            total_cost += startup_cost
+                            self.state.start_diesel(ds_id_island, now)
+                            notes.append(f"[孤岛] 启动柴油机填补购电缺口，出力 {diesel_fill:.2f}kW")
+                        else:
+                            notes.append(f"[孤岛] 柴油机增出力填补购电缺口 {diesel_fill:.2f}kW")
+                        island_remaining -= diesel_fill
+
+                bes_id_island = list(config.BESS_CONFIG.keys())[0]
+                if island_remaining > 0.01:
+                    max_discharge = self.state.get_bess_max_discharge(bes_id_island, time_interval_hours)
+                    island_soc_min = self.state.island_manager.get_island_soc_min()
+                    cfg_bess = config.BESS_CONFIG[bes_id_island]
+                    bs = self.state.bess_state[bes_id_island]
+                    if bs.soc > island_soc_min:
+                        energy_avail = (bs.soc - island_soc_min) * cfg_bess["capacity_kwh"]
+                        max_by_island_soc = energy_avail * cfg_bess["discharge_efficiency"] / time_interval_hours
+                        island_max_discharge = min(max_discharge, max_by_island_soc,
+                                                   cfg_bess["max_discharge_power"] - bess_action[bes_id_island].get("discharge_kw", 0.0))
+                        batt_fill = min(island_remaining, island_max_discharge)
+                        if batt_fill > 0:
+                            bess_action[bes_id_island]["discharge_kw"] = bess_action[bes_id_island].get("discharge_kw", 0.0) + batt_fill
+                            island_remaining -= batt_fill
+                            notes.append(f"[孤岛] 电池放电填补购电缺口 {batt_fill:.2f}kW")
+
+                if island_remaining > 0.01:
+                    shed_result_island, unshed_gap = self.state.compute_priority_load_shedding_dynamic(
+                        island_remaining, now, dispatch_id
+                    )
+                    total_shed_actual = sum(shed_result_island.values())
+                    load_shed_kw += total_shed_actual + unshed_gap
+                    if total_shed_actual > 0.01:
+                        shed_breakdown_island = []
+                        for gid, kw in shed_result_island.items():
+                            gcfg = config.LOAD_GROUP_CONFIG[gid]
+                            shed_breakdown_island.append(f"{gcfg['name']}切{kw:.2f}kW")
+                            group_shed_details[gid] = {
+                                "group_id": gid,
+                                "name": gcfg["name"],
+                                "shed_kw": round(kw, 2),
+                                "shed_priority": gcfg["shed_priority"],
+                            }
+                        notes.append(f"[孤岛] 供电不足，按优先级甩负荷: {', '.join(shed_breakdown_island)}")
+                        self.state.add_alert(
+                            "ISLAND_LOAD_SHEDDING",
+                            f"孤岛模式供电不足，甩负荷 {total_shed_actual:.2f}kW",
+                            {"shed_kw": total_shed_actual, "shed_by_group": shed_result_island}
+                        )
+
+            if grid_export_kw > 0.001:
+                surplus_island = grid_export_kw
+                grid_export_kw = 0.0
+                total_cost += surplus_island * time_interval_hours * feed_in_price
+                bes_id_surplus = list(config.BESS_CONFIG.keys())[0]
+                cfg_bess_s = config.BESS_CONFIG[bes_id_surplus]
+                bs_s = self.state.bess_state[bes_id_surplus]
+                if bs_s.soc < cfg_bess_s["soc_max"]:
+                    charge_space = (cfg_bess_s["soc_max"] - bs_s.soc) * cfg_bess_s["capacity_kwh"]
+                    max_charge_by_space = charge_space / cfg_bess_s["charge_efficiency"] / time_interval_hours
+                    charge_kw = min(surplus_island, cfg_bess_s["max_charge_power"], max_charge_by_space)
+                    if charge_kw > 0:
+                        bess_action[bes_id_surplus]["charge_kw"] = bess_action[bes_id_surplus].get("charge_kw", 0.0) + charge_kw
+                        surplus_island -= charge_kw
+                        notes.append(f"[孤岛] 盈余充电 {charge_kw:.2f}kW (无法上网)")
+                notes.append(f"[孤岛] 弃电 {surplus_island:.2f}kW (无法上网售电)")
+
+            self.state.stats.total_grid_import_kwh = max(0, self.state.stats.total_grid_import_kwh - grid_import_kw * time_interval_hours)
+            self.state.stats.total_grid_export_kwh = max(0, self.state.stats.total_grid_export_kwh)
+
+        island_mgr = self.state.island_manager
+        total_renewable_for_update = sum(pv_output.values()) + sum(wt_output.values())
+        diesel_kw_for_update = sum(diesel_output.values())
+        diesel_kwh_for_update = sum(diesel_output.values()) * time_interval_hours
+        island_mgr.update_dispatch_cycle(
+            now=now,
+            total_renewable_kw=total_renewable_for_update,
+            diesel_kw=diesel_kw_for_update,
+            load_shed_kw=load_shed_kw,
+            diesel_generated_kwh=diesel_kwh_for_update,
+        )
 
         load_served = load_kw - load_shed_kw
 

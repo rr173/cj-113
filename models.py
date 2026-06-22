@@ -1466,6 +1466,9 @@ class MicrogridState:
         self.reactive_power_manager = None
         self._init_reactive_power_manager()
 
+        from island_manager import IslandManager
+        self.island_manager = IslandManager(self)
+
         from day_ahead_engine import DayAheadDispatchEngine
         self.day_ahead_engine = DayAheadDispatchEngine(self)
         self.day_ahead_forecasts: Dict[str, DayAheadForecast] = {}

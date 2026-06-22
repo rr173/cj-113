@@ -220,3 +220,12 @@ REACTIVE_POWER_CONFIG = {
     "penalty_per_percent_below": 50.0,
     "history_size": 1000,
 }
+
+ISLAND_MODE_CONFIG = {
+    "island_soc_min": 0.30,
+    "black_start_soc_target": 0.50,
+    "source_stability_required_periods": 3,
+    "source_stability_fluctuation_threshold": 0.10,
+    "load_restore_max_rate_per_cycle": 0.25,
+    "diesel_efficiency_kwh_per_liter": 3.5,
+}

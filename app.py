@@ -2260,6 +2260,93 @@ def reset_carbon_accumulated():
     })
 
 
+@app.route("/api/island/mode", methods=["GET"])
+def get_island_mode():
+    """查询当前运行模式和模式详情"""
+    mgr = state.island_manager
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "mode": mgr.get_mode_details(),
+    })
+
+
+@app.route("/api/island/trigger-outage", methods=["POST"])
+def trigger_grid_outage():
+    """
+    模拟电网停电，触发孤岛模式
+    请求体: {} (无需参数)
+    """
+    now = datetime.now()
+    result = state.island_manager.trigger_grid_outage(now)
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "触发失败")}), 400
+    return jsonify({
+        "status": "ok",
+        "message": f"电网停电，已切换至{result['mode_chinese']}",
+        "result": result,
+    })
+
+
+@app.route("/api/island/trigger-recovery", methods=["POST"])
+def trigger_grid_recovery():
+    """
+    模拟电网恢复，启动黑启动流程
+    请求体: {} (无需参数)
+    """
+    now = datetime.now()
+    result = state.island_manager.trigger_grid_recovery(now)
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "触发失败")}), 400
+    return jsonify({
+        "status": "ok",
+        "message": f"电网恢复，已进入黑启动流程",
+        "result": result,
+    })
+
+
+@app.route("/api/island/events", methods=["GET"])
+def get_island_events():
+    """
+    查询孤岛事件历史
+    参数: limit (可选，默认100)
+    """
+    try:
+        limit = int(request.args.get("limit", 100))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+    events = state.island_manager.get_island_events(limit)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "total_events": len(state.island_manager.island_events),
+        "returned": len(events),
+        "events": events,
+    })
+
+
+@app.route("/api/island/black-start-progress", methods=["GET"])
+def get_black_start_progress():
+    """查询黑启动进度（当前在哪一步、还差什么条件）"""
+    progress = state.island_manager.get_black_start_progress()
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "progress": progress,
+    })
+
+
+@app.route("/api/island/supply-stats", methods=["GET"])
+def get_island_supply_stats():
+    """查询孤岛期间的供电保障统计"""
+    stats = state.island_manager.get_island_supply_stats()
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "supply_stats": stats,
+    })
+
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({
@@ -2293,6 +2380,11 @@ def health_check():
             "completed_plans": len([p for p in state.maintenance_plans.values() if p.status == "completed"]),
             "cancelled_plans": len([p for p in state.maintenance_plans.values() if p.status == "cancelled"]),
             "active_restrictions": len(state._active_maintenance_restrictions),
+        },
+        "island_mode": {
+            "mode": state.island_manager.mode.value,
+            "mode_chinese": state.island_manager.get_mode_name(),
+            "island_event_count": len(state.island_manager.island_events),
         },
     })
 
