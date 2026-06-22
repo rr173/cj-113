@@ -141,6 +141,38 @@ class FaultEvent:
 
 
 @dataclass
+class MaintenancePlan:
+    plan_id: str
+    device_type: str
+    device_id: str
+    start_time: datetime
+    end_time: datetime
+    maintenance_type: str
+    handling_mode: str
+    derating_percent: float = 0.0
+    status: str = "pending"
+    created_at: datetime = field(default_factory=datetime.now)
+    actual_start_time: Optional[datetime] = None
+    actual_end_time: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
+    cancelled_reason: str = ""
+    notes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class MaintenanceRestriction:
+    device_type: str
+    device_id: str
+    plan_id: str
+    maintenance_type: str
+    handling_mode: str
+    derating_percent: float = 0.0
+    is_bess: bool = False
+    soc_min_override: Optional[float] = None
+    soc_max_override: Optional[float] = None
+
+
+@dataclass
 class BatteryHealth:
     equivalent_cycles: float = 0.0
     last_cycle_soc_peak: Optional[float] = None
@@ -836,6 +868,11 @@ class MicrogridState:
         self.arbitrage_analyzer = None
         self._init_arbitrage_analyzer()
 
+        self.maintenance_plans: Dict[str, MaintenancePlan] = {}
+        self._maintenance_plan_counter: int = 0
+        self._active_maintenance_restrictions: Dict[str, MaintenanceRestriction] = {}
+        self._bess_original_soc_limits: Dict[str, Dict[str, float]] = {}
+
     def _init_carbon_manager(self):
         from carbon_manager import CarbonManager
         self.carbon_manager = CarbonManager(self)
@@ -927,32 +964,57 @@ class MicrogridState:
         ds = self.diesel_state[ds_id]
         report = self.diesel_reports.get(ds_id)
 
+        restriction = self.get_device_maintenance_restriction("diesel", ds_id)
+        if restriction:
+            if restriction.handling_mode == "full_shutdown":
+                return {"can_run": False, "max_output": 0.0, "reason": "设备维保中，完全停用",
+                        "maintenance_active": True, "handling_mode": "full_shutdown",
+                        "plan_id": restriction.plan_id}
+            else:
+                maintenance_info = {
+                    "maintenance_active": True,
+                    "handling_mode": "derated",
+                    "derating_percent": restriction.derating_percent,
+                    "plan_id": restriction.plan_id,
+                }
+
         if report is None or not report.available:
-            return {"can_run": False, "max_output": 0.0, "reason": "柴油机不可用或未上报"}
+            result = {"can_run": False, "max_output": 0.0, "reason": "柴油机不可用或未上报"}
+            if restriction:
+                result.update(maintenance_info)
+            return result
 
         rated = cfg["rated_power"]
+        if restriction and restriction.handling_mode == "derated":
+            rated = rated * (1.0 - restriction.derating_percent / 100.0)
 
         if ds.running:
             elapsed = (now - ds.last_start_time).total_seconds() / 60.0 if ds.last_start_time else 0
-            return {
+            result = {
                 "can_run": True,
                 "max_output": rated,
                 "already_running": True,
                 "min_runtime_elapsed": elapsed >= cfg["min_runtime_minutes"],
                 "startup_cost_applies": False,
             }
+            if restriction:
+                result.update(maintenance_info)
+            return result
         else:
             if ds.last_stop_time:
                 cooldown_passed = (now - ds.last_stop_time).total_seconds() / 60.0 >= cfg["cooldown_minutes"]
             else:
                 cooldown_passed = True
-            return {
+            result = {
                 "can_run": cooldown_passed,
                 "max_output": rated if cooldown_passed else 0.0,
                 "already_running": False,
                 "cooldown_passed": cooldown_passed,
                 "startup_cost_applies": cooldown_passed,
             }
+            if restriction:
+                result.update(maintenance_info)
+            return result
 
     def get_bess_max_discharge(self, bes_id: str, time_interval_hours: float) -> float:
         cfg = config.BESS_CONFIG[bes_id]
@@ -962,7 +1024,13 @@ class MicrogridState:
             return 0.0
         energy_avail = (bs.soc - soc_min) * cfg["capacity_kwh"]
         max_by_energy = energy_avail * cfg["discharge_efficiency"] / time_interval_hours
-        return min(cfg["max_discharge_power"], max_by_energy)
+
+        max_power = cfg["max_discharge_power"]
+        restriction = self.get_device_maintenance_restriction("bess", bes_id)
+        if restriction and restriction.handling_mode == "derated":
+            max_power = max_power * (1.0 - restriction.derating_percent / 100.0)
+
+        return min(max_power, max_by_energy)
 
     def get_bess_max_charge(self, bes_id: str, time_interval_hours: float) -> float:
         cfg = config.BESS_CONFIG[bes_id]
@@ -972,7 +1040,13 @@ class MicrogridState:
             return 0.0
         energy_avail = (soc_max - bs.soc) * cfg["capacity_kwh"]
         max_by_energy = energy_avail / cfg["charge_efficiency"] / time_interval_hours
-        return min(cfg["max_charge_power"], max_by_energy)
+
+        max_power = cfg["max_charge_power"]
+        restriction = self.get_device_maintenance_restriction("bess", bes_id)
+        if restriction and restriction.handling_mode == "derated":
+            max_power = max_power * (1.0 - restriction.derating_percent / 100.0)
+
+        return min(max_power, max_by_energy)
 
     def update_bess_soc(self, bes_id: str, charge_kw: float, discharge_kw: float, time_interval_hours: float):
         cfg = config.BESS_CONFIG[bes_id]
@@ -2722,6 +2796,314 @@ class MicrogridState:
             else:
                 del self.weekly_reports[key]
         return True
+
+    def _generate_maintenance_plan_id(self) -> str:
+        self._maintenance_plan_counter += 1
+        return f"MAINT-{self._maintenance_plan_counter:06d}"
+
+    def _validate_device(self, device_type: str, device_id: str) -> bool:
+        if device_type == "pv":
+            return device_id in config.PV_CONFIG
+        elif device_type == "wt":
+            return device_id in config.WT_CONFIG
+        elif device_type == "diesel":
+            return device_id in config.DIESEL_CONFIG
+        elif device_type == "bess":
+            return device_id in config.BESS_CONFIG
+        return False
+
+    def create_maintenance_plan(self,
+                                 device_type: str,
+                                 device_id: str,
+                                 start_time: datetime,
+                                 end_time: datetime,
+                                 maintenance_type: str,
+                                 handling_mode: str,
+                                 derating_percent: float = 0.0) -> Dict[str, Any]:
+        valid_device_types = {"pv", "wt", "diesel", "bess"}
+        valid_maintenance_types = {"routine_inspection", "preventive_maintenance", "fault_repair"}
+        valid_handling_modes = {"full_shutdown", "derated"}
+
+        if device_type not in valid_device_types:
+            return {"success": False, "error": f"device_type 必须是 {valid_device_types} 之一"}
+        if not self._validate_device(device_type, device_id):
+            return {"success": False, "error": f"未找到设备: {device_type}:{device_id}"}
+        if maintenance_type not in valid_maintenance_types:
+            return {"success": False, "error": f"maintenance_type 必须是 {valid_maintenance_types} 之一"}
+        if handling_mode not in valid_handling_modes:
+            return {"success": False, "error": f"handling_mode 必须是 {valid_handling_modes} 之一"}
+        if handling_mode == "derated" and not (0 < derating_percent < 100):
+            return {"success": False, "error": "derating_percent 必须在 (0, 100) 区间内"}
+        if start_time >= end_time:
+            return {"success": False, "error": "start_time 必须早于 end_time"}
+
+        plan_id = self._generate_maintenance_plan_id()
+        plan = MaintenancePlan(
+            plan_id=plan_id,
+            device_type=device_type,
+            device_id=device_id,
+            start_time=start_time,
+            end_time=end_time,
+            maintenance_type=maintenance_type,
+            handling_mode=handling_mode,
+            derating_percent=derating_percent if handling_mode == "derated" else 0.0,
+            status="pending",
+        )
+        self.maintenance_plans[plan_id] = plan
+
+        self.add_alert(
+            "MAINTENANCE_PLAN_CREATED",
+            f"维保计划已创建: {plan_id}，设备 {device_type}:{device_id}，"
+            f"时间 {start_time.strftime('%Y-%m-%d %H:%M')} ~ {end_time.strftime('%Y-%m-%d %H:%M')}",
+            {"plan_id": plan_id, "device_type": device_type, "device_id": device_id,
+             "start_time": start_time.isoformat(), "end_time": end_time.isoformat()}
+        )
+
+        return {"success": True, "plan_id": plan_id, "plan": self._maintenance_plan_to_dict(plan)}
+
+    def _maintenance_plan_to_dict(self, plan: MaintenancePlan) -> Dict[str, Any]:
+        type_cn = {
+            "routine_inspection": "日常巡检",
+            "preventive_maintenance": "预防性维护",
+            "fault_repair": "故障抢修",
+        }
+        mode_cn = {
+            "full_shutdown": "完全停用",
+            "derated": "降额运行",
+        }
+        status_cn = {
+            "pending": "待执行",
+            "active": "执行中",
+            "completed": "已完成",
+            "cancelled": "已取消",
+        }
+        return {
+            "plan_id": plan.plan_id,
+            "device_type": plan.device_type,
+            "device_type_chinese": {"pv": "光伏", "wt": "风电", "diesel": "柴油机", "bess": "储能电池"}.get(plan.device_type, plan.device_type),
+            "device_id": plan.device_id,
+            "start_time": plan.start_time.isoformat(),
+            "end_time": plan.end_time.isoformat(),
+            "maintenance_type": plan.maintenance_type,
+            "maintenance_type_chinese": type_cn.get(plan.maintenance_type, plan.maintenance_type),
+            "handling_mode": plan.handling_mode,
+            "handling_mode_chinese": mode_cn.get(plan.handling_mode, plan.handling_mode),
+            "derating_percent": plan.derating_percent,
+            "status": plan.status,
+            "status_chinese": status_cn.get(plan.status, plan.status),
+            "created_at": plan.created_at.isoformat(),
+            "actual_start_time": plan.actual_start_time.isoformat() if plan.actual_start_time else None,
+            "actual_end_time": plan.actual_end_time.isoformat() if plan.actual_end_time else None,
+            "cancelled_at": plan.cancelled_at.isoformat() if plan.cancelled_at else None,
+            "cancelled_reason": plan.cancelled_reason,
+            "notes": plan.notes,
+        }
+
+    def list_maintenance_plans(self, status: str = None, device_type: str = None,
+                                device_id: str = None, limit: int = 100,
+                                offset: int = 0) -> Dict[str, Any]:
+        plans = list(self.maintenance_plans.values())
+        if status:
+            plans = [p for p in plans if p.status == status]
+        if device_type:
+            plans = [p for p in plans if p.device_type == device_type]
+        if device_id:
+            plans = [p for p in plans if p.device_id == device_id]
+        plans.sort(key=lambda p: p.created_at, reverse=True)
+        total = len(plans)
+        sliced = plans[offset:offset + limit]
+        return {
+            "total": total,
+            "returned": len(sliced),
+            "limit": limit,
+            "offset": offset,
+            "plans": [self._maintenance_plan_to_dict(p) for p in sliced],
+        }
+
+    def get_maintenance_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        plan = self.maintenance_plans.get(plan_id)
+        if plan is None:
+            return None
+        return self._maintenance_plan_to_dict(plan)
+
+    def cancel_maintenance_plan(self, plan_id: str, reason: str = "") -> Dict[str, Any]:
+        plan = self.maintenance_plans.get(plan_id)
+        if plan is None:
+            return {"success": False, "error": f"未找到维保计划: {plan_id}"}
+        if plan.status != "pending":
+            return {"success": False, "error": f"只能取消待执行状态的计划，当前状态: {plan.status}"}
+
+        plan.status = "cancelled"
+        plan.cancelled_at = datetime.now()
+        plan.cancelled_reason = reason
+
+        self.add_alert(
+            "MAINTENANCE_PLAN_CANCELLED",
+            f"维保计划已取消: {plan_id}，原因: {reason or '未提供'}",
+            {"plan_id": plan_id, "reason": reason}
+        )
+
+        return {"success": True, "plan": self._maintenance_plan_to_dict(plan)}
+
+    def end_maintenance_plan_early(self, plan_id: str) -> Dict[str, Any]:
+        plan = self.maintenance_plans.get(plan_id)
+        if plan is None:
+            return {"success": False, "error": f"未找到维保计划: {plan_id}"}
+        if plan.status != "active":
+            return {"success": False, "error": f"只能提前结束执行中状态的计划，当前状态: {plan.status}"}
+
+        now = datetime.now()
+        self._deactivate_maintenance_plan(plan, now)
+
+        self.add_alert(
+            "MAINTENANCE_PLAN_ENDED_EARLY",
+            f"维保计划提前结束: {plan_id}，设备 {plan.device_type}:{plan.device_id} 已恢复正常",
+            {"plan_id": plan_id, "device_type": plan.device_type, "device_id": plan.device_id}
+        )
+
+        return {"success": True, "plan": self._maintenance_plan_to_dict(plan)}
+
+    def get_device_maintenance_history(self, device_type: str, device_id: str,
+                                        limit: int = 50) -> Dict[str, Any]:
+        if not self._validate_device(device_type, device_id):
+            return {"success": False, "error": f"未找到设备: {device_type}:{device_id}"}
+
+        plans = [p for p in self.maintenance_plans.values()
+                 if p.device_type == device_type and p.device_id == device_id]
+        plans.sort(key=lambda p: p.created_at, reverse=True)
+        total = len(plans)
+        sliced = plans[:limit]
+        return {
+            "success": True,
+            "device_type": device_type,
+            "device_id": device_id,
+            "total_plans": total,
+            "returned": len(sliced),
+            "history": [self._maintenance_plan_to_dict(p) for p in sliced],
+        }
+
+    def get_current_maintenance_restrictions(self) -> Dict[str, Any]:
+        result = []
+        for key, restriction in self._active_maintenance_restrictions.items():
+            plan = self.maintenance_plans.get(restriction.plan_id)
+            entry = {
+                "device_key": key,
+                "device_type": restriction.device_type,
+                "device_type_chinese": {"pv": "光伏", "wt": "风电", "diesel": "柴油机", "bess": "储能电池"}.get(restriction.device_type, restriction.device_type),
+                "device_id": restriction.device_id,
+                "plan_id": restriction.plan_id,
+                "maintenance_type": restriction.maintenance_type,
+                "maintenance_type_chinese": {
+                    "routine_inspection": "日常巡检",
+                    "preventive_maintenance": "预防性维护",
+                    "fault_repair": "故障抢修",
+                }.get(restriction.maintenance_type, restriction.maintenance_type),
+                "handling_mode": restriction.handling_mode,
+                "handling_mode_chinese": {"full_shutdown": "完全停用", "derated": "降额运行"}.get(restriction.handling_mode, restriction.handling_mode),
+                "derating_percent": restriction.derating_percent,
+                "is_bess": restriction.is_bess,
+            }
+            if restriction.is_bess:
+                entry["soc_min_percent"] = round(restriction.soc_min_override * 100, 1) if restriction.soc_min_override else None
+                entry["soc_max_percent"] = round(restriction.soc_max_override * 100, 1) if restriction.soc_max_override else None
+            if plan:
+                entry["start_time"] = plan.start_time.isoformat()
+                entry["end_time"] = plan.end_time.isoformat()
+            result.append(entry)
+        return {
+            "total_affected": len(result),
+            "restrictions": result,
+        }
+
+    def _activate_maintenance_plan(self, plan: MaintenancePlan, now: datetime) -> MaintenanceRestriction:
+        restriction = MaintenanceRestriction(
+            device_type=plan.device_type,
+            device_id=plan.device_id,
+            plan_id=plan.plan_id,
+            maintenance_type=plan.maintenance_type,
+            handling_mode=plan.handling_mode,
+            derating_percent=plan.derating_percent,
+            is_bess=(plan.device_type == "bess"),
+        )
+
+        if plan.device_type == "bess":
+            restriction.soc_min_override = 0.30
+            restriction.soc_max_override = 0.70
+            if plan.device_id not in self._bess_original_soc_limits:
+                cfg = config.BESS_CONFIG[plan.device_id]
+                self._bess_original_soc_limits[plan.device_id] = {
+                    "soc_min": cfg["soc_min"],
+                    "soc_max": cfg["soc_max"],
+                }
+            cfg = config.BESS_CONFIG[plan.device_id]
+            cfg["soc_min"] = 0.30
+            cfg["soc_max"] = 0.70
+            bs = self.bess_state.get(plan.device_id)
+            if bs:
+                if bs.soc < 0.30:
+                    bs.soc = 0.30
+                elif bs.soc > 0.70:
+                    bs.soc = 0.70
+
+        key = f"{plan.device_type}:{plan.device_id}"
+        self._active_maintenance_restrictions[key] = restriction
+
+        plan.status = "active"
+        plan.actual_start_time = now
+        plan.notes.append(f"维保于 {now.strftime('%Y-%m-%d %H:%M:%S')} 自动开始生效")
+
+        return restriction
+
+    def _deactivate_maintenance_plan(self, plan: MaintenancePlan, now: datetime):
+        key = f"{plan.device_type}:{plan.device_id}"
+        if key in self._active_maintenance_restrictions:
+            restriction = self._active_maintenance_restrictions[key]
+            if restriction.is_bess and plan.device_id in self._bess_original_soc_limits:
+                original = self._bess_original_soc_limits.pop(plan.device_id)
+                cfg = config.BESS_CONFIG[plan.device_id]
+                cfg["soc_min"] = original["soc_min"]
+                cfg["soc_max"] = original["soc_max"]
+            del self._active_maintenance_restrictions[key]
+
+        plan.status = "completed"
+        plan.actual_end_time = now
+        plan.notes.append(f"维保于 {now.strftime('%Y-%m-%d %H:%M:%S')} 结束，设备恢复正常")
+
+    def check_and_update_maintenance_plans(self, now: datetime) -> Dict[str, Any]:
+        started_plans = []
+        ended_plans = []
+
+        for plan in self.maintenance_plans.values():
+            if plan.status == "pending" and plan.start_time <= now:
+                restriction = self._activate_maintenance_plan(plan, now)
+                started_plans.append({
+                    "plan_id": plan.plan_id,
+                    "device_type": plan.device_type,
+                    "device_id": plan.device_id,
+                    "handling_mode": plan.handling_mode,
+                    "derating_percent": plan.derating_percent,
+                    "is_bess": restriction.is_bess,
+                    "soc_min_override": restriction.soc_min_override,
+                    "soc_max_override": restriction.soc_max_override,
+                })
+
+            if plan.status == "active" and plan.end_time <= now:
+                self._deactivate_maintenance_plan(plan, now)
+                ended_plans.append({
+                    "plan_id": plan.plan_id,
+                    "device_type": plan.device_type,
+                    "device_id": plan.device_id,
+                })
+
+        return {
+            "started": started_plans,
+            "ended": ended_plans,
+            "total_active": len(self._active_maintenance_restrictions),
+        }
+
+    def get_device_maintenance_restriction(self, device_type: str, device_id: str) -> Optional[MaintenanceRestriction]:
+        key = f"{device_type}:{device_id}"
+        return self._active_maintenance_restrictions.get(key)
 
 
 @dataclass

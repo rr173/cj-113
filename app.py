@@ -2286,6 +2286,14 @@ def health_check():
             "duty_staff_count": len(state.alert_manager.list_duty_staff()),
             "notification_count": len(state.alert_manager.get_notifications()),
         },
+        "maintenance": {
+            "total_plans": len(state.maintenance_plans),
+            "pending_plans": len([p for p in state.maintenance_plans.values() if p.status == "pending"]),
+            "active_plans": len([p for p in state.maintenance_plans.values() if p.status == "active"]),
+            "completed_plans": len([p for p in state.maintenance_plans.values() if p.status == "completed"]),
+            "cancelled_plans": len([p for p in state.maintenance_plans.values() if p.status == "cancelled"]),
+            "active_restrictions": len(state._active_maintenance_restrictions),
+        },
     })
 
 
@@ -3040,6 +3048,200 @@ def get_arbitrage_config():
     })
 
 
+@app.route("/api/maintenance/plans", methods=["POST"])
+def create_maintenance_plan():
+    """
+    创建维保计划
+    请求体: {
+        "device_type": "pv|wt|diesel|bess",        必填
+        "device_id": "设备ID",                      必填
+        "start_time": "ISO格式开始时间",             必填
+        "end_time": "ISO格式结束时间",               必填
+        "maintenance_type": "routine_inspection|preventive_maintenance|fault_repair",  必填
+        "handling_mode": "full_shutdown|derated",    必填
+        "derating_percent": 30.0                     derated时必填，0~100之间
+    }
+    """
+    data = request.get_json(force=True) or {}
+    required = ["device_type", "device_id", "start_time", "end_time", "maintenance_type", "handling_mode"]
+    for f in required:
+        if f not in data:
+            return jsonify({"error": f"缺少必填字段: {f}"}), 400
+
+    try:
+        start_time = datetime.fromisoformat(data["start_time"])
+        end_time = datetime.fromisoformat(data["end_time"])
+    except ValueError:
+        return jsonify({"error": "时间格式错误，请使用ISO格式，如 2024-06-18T10:00:00"}), 400
+
+    derating_percent = float(data.get("derating_percent", 0.0))
+
+    result = state.create_maintenance_plan(
+        device_type=data["device_type"],
+        device_id=data["device_id"],
+        start_time=start_time,
+        end_time=end_time,
+        maintenance_type=data["maintenance_type"],
+        handling_mode=data["handling_mode"],
+        derating_percent=derating_percent,
+    )
+
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "创建失败")}), 400
+
+    return jsonify({
+        "status": "ok",
+        "message": "维保计划创建成功",
+        "plan_id": result["plan_id"],
+        "plan": result["plan"],
+    })
+
+
+@app.route("/api/maintenance/plans", methods=["GET"])
+def list_maintenance_plans():
+    """
+    查询维保计划列表
+    参数:
+      - status: pending|active|completed|cancelled  可选，按状态筛选
+      - device_type: pv|wt|diesel|bess              可选，按设备类型筛选
+      - device_id: 设备ID                            可选，按设备ID筛选
+      - limit: 返回数量，默认100
+      - offset: 偏移量，默认0
+    """
+    status = request.args.get("status")
+    device_type = request.args.get("device_type")
+    device_id = request.args.get("device_id")
+    try:
+        limit = int(request.args.get("limit", 100))
+        offset = int(request.args.get("offset", 0))
+    except ValueError:
+        return jsonify({"error": "limit 和 offset 必须是整数"}), 400
+
+    if status and status not in ("pending", "active", "completed", "cancelled"):
+        return jsonify({"error": "status 必须是 pending|active|completed|cancelled 之一"}), 400
+    if device_type and device_type not in ("pv", "wt", "diesel", "bess"):
+        return jsonify({"error": "device_type 必须是 pv|wt|diesel|bess 之一"}), 400
+
+    result = state.list_maintenance_plans(
+        status=status,
+        device_type=device_type,
+        device_id=device_id,
+        limit=limit,
+        offset=offset,
+    )
+
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        **result,
+    })
+
+
+@app.route("/api/maintenance/plans/<plan_id>", methods=["GET"])
+def get_maintenance_plan(plan_id):
+    """查询单个维保计划详情"""
+    plan = state.get_maintenance_plan(plan_id)
+    if plan is None:
+        return jsonify({"error": f"未找到维保计划: {plan_id}"}), 404
+    return jsonify({
+        "status": "ok",
+        "plan": plan,
+    })
+
+
+@app.route("/api/maintenance/plans/<plan_id>/cancel", methods=["POST"])
+def cancel_maintenance_plan(plan_id):
+    """
+    取消未开始的维保计划
+    请求体 (可选): {
+        "reason": "取消原因"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason", "")
+
+    result = state.cancel_maintenance_plan(plan_id, reason=reason)
+
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "取消失败")}), 400
+
+    return jsonify({
+        "status": "ok",
+        "message": "维保计划已取消",
+        "plan": result["plan"],
+    })
+
+
+@app.route("/api/maintenance/plans/<plan_id>/end", methods=["POST"])
+def end_maintenance_plan_early(plan_id):
+    """
+    提前结束正在执行的维保计划（立即恢复设备）
+    """
+    result = state.end_maintenance_plan_early(plan_id)
+
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "结束失败")}), 400
+
+    return jsonify({
+        "status": "ok",
+        "message": "维保计划已提前结束，设备已恢复正常",
+        "plan": result["plan"],
+    })
+
+
+@app.route("/api/maintenance/history/<device_type>/<device_id>", methods=["GET"])
+def get_device_maintenance_history(device_type, device_id):
+    """
+    查询某设备的维保历史
+    URL参数:
+      - device_type: pv|wt|diesel|bess
+      - device_id: 设备ID
+    Query参数:
+      - limit: 返回数量，默认50
+    """
+    if device_type not in ("pv", "wt", "diesel", "bess"):
+        return jsonify({"error": "device_type 必须是 pv|wt|diesel|bess 之一"}), 400
+
+    try:
+        limit = int(request.args.get("limit", 50))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+
+    result = state.get_device_maintenance_history(device_type, device_id, limit=limit)
+
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "查询失败")}), 400
+
+    return jsonify(result)
+
+
+@app.route("/api/maintenance/active", methods=["GET"])
+def get_current_maintenance_restrictions():
+    """
+    查询当前所有受维保影响的设备及其限制详情
+    """
+    result = state.get_current_maintenance_restrictions()
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        **result,
+    })
+
+
+@app.route("/api/maintenance/check", methods=["POST"])
+def manual_check_maintenance_plans():
+    """
+    手动触发维保计划状态检查（正常情况下调度会自动检查，此接口用于调试）
+    """
+    now = datetime.now()
+    result = state.check_and_update_maintenance_plans(now)
+    return jsonify({
+        "status": "ok",
+        "check_time": now.isoformat(),
+        **result,
+    })
+
+
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({"error": "接口不存在", "available_endpoints": _list_endpoints()}), 404
@@ -3125,6 +3327,14 @@ def _list_endpoints():
         "POST /api/arbitrage/alerts/<alert_id>/acknowledge - 确认套利告警",
         "GET /api/arbitrage/hourly/<date> - 查询指定日期的逐小时套利记录",
         "GET /api/arbitrage/config - 查询套利分析配置参数",
+        "POST /api/maintenance/plans - 创建维保计划",
+        "GET /api/maintenance/plans - 查询维保计划列表（按状态/设备筛选）",
+        "GET /api/maintenance/plans/<plan_id> - 查询单个维保计划详情",
+        "POST /api/maintenance/plans/<plan_id>/cancel - 取消未开始的维保计划",
+        "POST /api/maintenance/plans/<plan_id>/end - 提前结束执行中的维保计划",
+        "GET /api/maintenance/history/<device_type>/<device_id> - 查询某设备的维保历史",
+        "GET /api/maintenance/active - 查询当前受维保影响的设备及限制详情",
+        "POST /api/maintenance/check - 手动触发维保计划状态检查（调试用）",
     ]
 
 

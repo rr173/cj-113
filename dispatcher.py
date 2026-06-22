@@ -42,6 +42,8 @@ class DispatchEngine:
                 missing.append("load")
             raise ValueError(f"缺少上报数据: {', '.join(missing)}")
 
+        maintenance_update = self.state.check_and_update_maintenance_plans(now)
+
         ds_manager = self.state.dual_strategy_manager
         dual_enabled = ds_manager.enable
         shadow_state_copy = None
@@ -85,12 +87,28 @@ class DispatchEngine:
         pv_output = {}
         for sid in config.PV_CONFIG:
             r = self.state.pv_reports.get(sid)
-            pv_output[sid] = max(0.0, r.power_kw) if (r and r.available) else 0.0
+            restriction = self.state.get_device_maintenance_restriction("pv", sid)
+            if restriction:
+                if restriction.handling_mode == "full_shutdown":
+                    pv_output[sid] = 0.0
+                else:
+                    base_pv = max(0.0, r.power_kw) if (r and r.available) else 0.0
+                    pv_output[sid] = base_pv * (1.0 - restriction.derating_percent / 100.0)
+            else:
+                pv_output[sid] = max(0.0, r.power_kw) if (r and r.available) else 0.0
 
         wt_output = {}
         for sid in config.WT_CONFIG:
             r = self.state.wt_reports.get(sid)
-            wt_output[sid] = max(0.0, r.power_kw) if (r and r.available) else 0.0
+            restriction = self.state.get_device_maintenance_restriction("wt", sid)
+            if restriction:
+                if restriction.handling_mode == "full_shutdown":
+                    wt_output[sid] = 0.0
+                else:
+                    base_wt = max(0.0, r.power_kw) if (r and r.available) else 0.0
+                    wt_output[sid] = base_wt * (1.0 - restriction.derating_percent / 100.0)
+            else:
+                wt_output[sid] = max(0.0, r.power_kw) if (r and r.available) else 0.0
 
         diesel_output = {}
         for ds_id in config.DIESEL_CONFIG:
@@ -125,6 +143,54 @@ class DispatchEngine:
         notes = []
         total_cost = 0.0
         diesel_startup_occurred = False
+
+        for plan_info in maintenance_update.get("started", []):
+            type_cn = {
+                "routine_inspection": "日常巡检",
+                "preventive_maintenance": "预防性维护",
+                "fault_repair": "故障抢修",
+            }
+            mode_cn = {
+                "full_shutdown": "完全停用",
+                "derated": f"降额{plan_info['derating_percent']}%运行",
+            }
+            device_cn = {"pv": "光伏", "wt": "风电", "diesel": "柴油机", "bess": "储能电池"}
+            msg = (f"[维保开始] 计划{plan_info['plan_id']}：{device_cn.get(plan_info['device_type'], plan_info['device_type'])}"
+                   f"设备{plan_info['device_id']}进入维保状态，处理方式：{mode_cn.get(plan_info['handling_mode'], plan_info['handling_mode'])}，"
+                   f"维保类型：{type_cn.get(plan_info.get('maintenance_type', ''), plan_info.get('maintenance_type', ''))}")
+            if plan_info.get("is_bess"):
+                msg += f"，SOC限制：{round(plan_info['soc_min_override']*100, 1)}%~{round(plan_info['soc_max_override']*100, 1)}%"
+            notes.append(msg)
+        for plan_info in maintenance_update.get("ended", []):
+            device_cn = {"pv": "光伏", "wt": "风电", "diesel": "柴油机", "bess": "储能电池"}
+            notes.append(
+                f"[维保结束] 计划{plan_info['plan_id']}：{device_cn.get(plan_info['device_type'], plan_info['device_type'])}"
+                f"设备{plan_info['device_id']}维保结束，已恢复正常运行"
+            )
+
+        active_restrictions = self.state.get_current_maintenance_restrictions()
+        bess_maintenance_disabled = set()
+        if active_restrictions["total_affected"] > 0:
+            for r in active_restrictions["restrictions"]:
+                if r["handling_mode"] == "full_shutdown" and r["device_type"] == "bess":
+                    bess_maintenance_disabled.add(r["device_id"])
+                elif r["device_type"] in ("pv", "wt"):
+                    notes.append(
+                        f"[维保留效] {r['device_type_chinese']}{r['device_id']}：{r['handling_mode_chinese']}"
+                        + (f"（降额{r['derating_percent']}%）" if r["handling_mode"] == "derated" else "")
+                    )
+                elif r["device_type"] == "diesel":
+                    notes.append(
+                        f"[维保留效] {r['device_type_chinese']}{r['device_id']}：{r['handling_mode_chinese']}"
+                        + (f"（降额{r['derating_percent']}%）" if r["handling_mode"] == "derated" else "")
+                    )
+                elif r["device_type"] == "bess":
+                    soc_info = f"，SOC限制{r['soc_min_percent']}%~{r['soc_max_percent']}%"
+                    notes.append(
+                        f"[维保留效] {r['device_type_chinese']}{r['device_id']}：{r['handling_mode_chinese']}"
+                        + (f"（降额{r['derating_percent']}%）" if r["handling_mode"] == "derated" else "")
+                        + soc_info
+                    )
         arbitrage_charge_kwh = 0.0
         arbitrage_charge_cost = 0.0
         arbitrage_discharge_kwh = 0.0
@@ -1323,6 +1389,13 @@ class DispatchEngine:
                     f"柴油机空载运行{elapsed:.1f}分钟，未满足最小运行时间{diesel_cfg['min_runtime_minutes']}分钟，维持空载",
                     {"runtime_minutes": elapsed, "min_runtime_minutes": diesel_cfg["min_runtime_minutes"]}
                 )
+
+        for bid in bess_action:
+            if bid in bess_maintenance_disabled:
+                if bess_action[bid]["charge_kw"] > 0 or bess_action[bid]["discharge_kw"] > 0:
+                    notes.append(f"[维保停用] 储能电池{bid}维保中，强制充放电功率为0")
+                bess_action[bid]["charge_kw"] = 0.0
+                bess_action[bid]["discharge_kw"] = 0.0
 
         soc_before_dispatch = bess_action[bes_id]["soc_before"]
         self.state.update_bess_soc(
