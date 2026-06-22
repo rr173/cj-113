@@ -209,3 +209,14 @@ ARBITRAGE_ANALYSIS_CONFIG = {
     "consecutive_low_days_threshold": 3,
     "passive_charge_from_renewable": True,
 }
+
+REACTIVE_POWER_CONFIG = {
+    "enable_reactive_compensation": True,
+    "capacitor_total_groups": 6,
+    "capacitor_kvar_per_group": 50.0,
+    "target_power_factor": 0.95,
+    "min_online_minutes": 10,
+    "min_switch_interval_minutes": 1,
+    "penalty_per_percent_below": 50.0,
+    "history_size": 1000,
+}

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field, asdict
@@ -22,12 +23,14 @@ class LoadGroupReport:
     group_id: str
     actual_power_kw: float
     timestamp: datetime
+    reactive_power_kvar: float = 0.0
 
 
 @dataclass
 class LoadReport:
     load_kw: float
     timestamp: datetime
+    reactive_load_kvar: float = 0.0
     group_reports: Dict[str, LoadGroupReport] = field(default_factory=dict)
 
 
@@ -759,6 +762,592 @@ class DualStrategyManager:
         return result
 
 
+@dataclass
+class CapacitorSwitchEvent:
+    event_id: str
+    timestamp: datetime
+    groups_before: int
+    groups_after: int
+    switch_delta: int
+    pf_before: float
+    pf_after: float
+    reactive_power_before_kvar: float
+    reactive_power_after_kvar: float
+    active_power_kw: float
+    reason: str
+    is_manual: bool = False
+
+
+@dataclass
+class PowerFactorAssessmentRecord:
+    record_id: str
+    dispatch_id: str
+    timestamp: datetime
+    active_power_kw: float
+    reactive_power_kvar: float
+    power_factor: float
+    target_power_factor: float
+    is_compliant: bool
+    penalty_amount: float
+    capacitor_groups_online: int
+    compensated_reactive_kvar: float
+
+
+@dataclass
+class CompensationLimitedEvent:
+    event_id: str
+    timestamp: datetime
+    active_power_kw: float
+    reactive_power_kvar: float
+    current_power_factor: float
+    target_power_factor: float
+    required_capacitor_groups: int
+    available_capacitor_groups: int
+    reason: str
+    constraint_type: str
+
+
+@dataclass
+class CapacitorGroupState:
+    group_id: int
+    online: bool = False
+    last_switch_time: Optional[datetime] = None
+    total_on_time_minutes: float = 0.0
+    switch_count: int = 0
+
+
+@dataclass
+class ReactivePowerState:
+    total_active_power_kw: float = 0.0
+    total_reactive_power_kvar: float = 0.0
+    current_power_factor: float = 1.0
+    capacitor_groups_online: int = 0
+    total_compensation_kvar: float = 0.0
+    last_switch_time: Optional[datetime] = None
+    capacitor_states: List[CapacitorGroupState] = field(default_factory=list)
+    switch_history: List[CapacitorSwitchEvent] = field(default_factory=list)
+    assessment_records: List[PowerFactorAssessmentRecord] = field(default_factory=list)
+    limited_events: List[CompensationLimitedEvent] = field(default_factory=list)
+    _switch_event_counter: int = 0
+    _assessment_counter: int = 0
+    _limited_event_counter: int = 0
+    monthly_penalty: float = 0.0
+    current_month: str = ""
+
+    def __post_init__(self):
+        import config
+        total_groups = config.REACTIVE_POWER_CONFIG["capacitor_total_groups"]
+        self.capacitor_states = [
+            CapacitorGroupState(group_id=i + 1)
+            for i in range(total_groups)
+        ]
+
+
+class ReactivePowerCompensationManager:
+    def __init__(self, state: MicrogridState):
+        self.state = state
+        self.reactive_state = ReactivePowerState()
+        self._check_month_reset()
+
+    def _check_month_reset(self):
+        now = datetime.now()
+        current_month = now.strftime("%Y-%m")
+        if self.reactive_state.current_month != current_month:
+            self.reactive_state.current_month = current_month
+            self.reactive_state.monthly_penalty = 0.0
+
+    def _generate_switch_event_id(self) -> str:
+        self.reactive_state._switch_event_counter += 1
+        return f"CAP-SW-{self.reactive_state._switch_event_counter:06d}"
+
+    def _generate_assessment_id(self) -> str:
+        self.reactive_state._assessment_counter += 1
+        return f"PF-ASM-{self.reactive_state._assessment_counter:06d}"
+
+    def _generate_limited_event_id(self) -> str:
+        self.reactive_state._limited_event_counter += 1
+        return f"COMP-LIM-{self.reactive_state._limited_event_counter:06d}"
+
+    def calculate_power_factor(self, active_kw: float, reactive_kvar: float) -> float:
+        import math
+        if active_kw == 0 and reactive_kvar == 0:
+            return 1.0
+        apparent_power = math.sqrt(active_kw ** 2 + reactive_kvar ** 2)
+        if apparent_power == 0:
+            return 1.0
+        return abs(active_kw) / apparent_power
+
+    def calculate_required_compensation(self, active_kw: float, reactive_kvar: float,
+                                        target_pf: float) -> float:
+        import math
+        if active_kw <= 0:
+            return 0.0
+        if target_pf >= 1.0:
+            target_pf = 0.999
+        current_pf = self.calculate_power_factor(active_kw, reactive_kvar)
+        if current_pf >= target_pf:
+            return 0.0
+        target_angle = math.acos(target_pf)
+        target_reactive = active_kw * math.tan(target_angle)
+        required_compensation = reactive_kvar - target_reactive
+        return max(0.0, required_compensation)
+
+    def can_switch(self, now: datetime = None) -> Tuple[bool, str]:
+        import config
+        if now is None:
+            now = datetime.now()
+        min_interval = config.REACTIVE_POWER_CONFIG["min_switch_interval_minutes"]
+        if self.reactive_state.last_switch_time is None:
+            return True, ""
+        elapsed = (now - self.reactive_state.last_switch_time).total_seconds() / 60.0
+        if elapsed < min_interval:
+            remaining = min_interval - elapsed
+            return False, f"投切间隔不足，还需等待{remaining:.1f}分钟"
+        return True, ""
+
+    def get_online_groups_past_min_hold(self, now: datetime = None) -> List[int]:
+        import config
+        if now is None:
+            now = datetime.now()
+        min_hold = config.REACTIVE_POWER_CONFIG["min_online_minutes"]
+        online_groups = []
+        for cs in self.reactive_state.capacitor_states:
+            if cs.online and cs.last_switch_time is not None:
+                elapsed = (now - cs.last_switch_time).total_seconds() / 60.0
+                if elapsed >= min_hold:
+                    online_groups.append(cs.group_id)
+        return online_groups
+
+    def get_offline_groups_available(self, now: datetime = None) -> List[int]:
+        import config
+        if now is None:
+            now = datetime.now()
+        min_interval = config.REACTIVE_POWER_CONFIG["min_switch_interval_minutes"]
+        offline_groups = []
+        for cs in self.reactive_state.capacitor_states:
+            if not cs.online:
+                if cs.last_switch_time is None:
+                    offline_groups.append(cs.group_id)
+                else:
+                    elapsed = (now - cs.last_switch_time).total_seconds() / 60.0
+                    if elapsed >= min_interval:
+                        offline_groups.append(cs.group_id)
+        return offline_groups
+
+    def _switch_groups(self, groups_to_add: int, groups_to_remove: int,
+                       active_kw: float, reactive_kvar: float,
+                       reason: str, is_manual: bool = False,
+                       now: datetime = None) -> CapacitorSwitchEvent:
+        import config
+        import math
+        if now is None:
+            now = datetime.now()
+
+        groups_before = self.reactive_state.capacitor_groups_online
+        pf_before = self.calculate_power_factor(active_kw, reactive_kvar)
+
+        kvar_per_group = config.REACTIVE_POWER_CONFIG["capacitor_kvar_per_group"]
+
+        for _ in range(groups_to_remove):
+            online_past_hold = self.get_online_groups_past_min_hold(now)
+            if online_past_hold:
+                group_id = online_past_hold[-1]
+                cs = self.reactive_state.capacitor_states[group_id - 1]
+                cs.online = False
+                if cs.last_switch_time is not None:
+                    cs.total_on_time_minutes += (now - cs.last_switch_time).total_seconds() / 60.0
+                cs.last_switch_time = now
+                cs.switch_count += 1
+                self.reactive_state.capacitor_groups_online -= 1
+
+        for _ in range(groups_to_add):
+            available = self.get_offline_groups_available(now)
+            if available:
+                group_id = available[0]
+                cs = self.reactive_state.capacitor_states[group_id - 1]
+                cs.online = True
+                cs.last_switch_time = now
+                cs.switch_count += 1
+                self.reactive_state.capacitor_groups_online += 1
+
+        groups_after = self.reactive_state.capacitor_groups_online
+        total_comp_kvar = groups_after * kvar_per_group
+        self.reactive_state.total_compensation_kvar = total_comp_kvar
+
+        net_reactive = reactive_kvar - total_comp_kvar
+        pf_after = self.calculate_power_factor(active_kw, net_reactive)
+
+        self.reactive_state.last_switch_time = now
+
+        event = CapacitorSwitchEvent(
+            event_id=self._generate_switch_event_id(),
+            timestamp=now,
+            groups_before=groups_before,
+            groups_after=groups_after,
+            switch_delta=groups_after - groups_before,
+            pf_before=pf_before,
+            pf_after=pf_after,
+            reactive_power_before_kvar=reactive_kvar,
+            reactive_power_after_kvar=net_reactive,
+            active_power_kw=active_kw,
+            reason=reason,
+            is_manual=is_manual,
+        )
+
+        self.reactive_state.switch_history.append(event)
+        history_size = config.REACTIVE_POWER_CONFIG["history_size"]
+        if len(self.reactive_state.switch_history) > history_size:
+            self.reactive_state.switch_history = self.reactive_state.switch_history[-history_size:]
+
+        return event
+
+    def execute_compensation(self, active_kw: float, reactive_kvar: float,
+                             dispatch_id: str = "", now: datetime = None) -> Dict[str, Any]:
+        import config
+        import math
+
+        if now is None:
+            now = datetime.now()
+
+        self._check_month_reset()
+
+        self.reactive_state.total_active_power_kw = active_kw
+        self.reactive_state.total_reactive_power_kvar = reactive_kvar
+
+        target_pf = config.REACTIVE_POWER_CONFIG["target_power_factor"]
+        kvar_per_group = config.REACTIVE_POWER_CONFIG["capacitor_kvar_per_group"]
+        total_groups = config.REACTIVE_POWER_CONFIG["capacitor_total_groups"]
+
+        current_pf = self.calculate_power_factor(active_kw, reactive_kvar)
+        self.reactive_state.current_power_factor = current_pf
+
+        result = {
+            "action_taken": False,
+            "current_pf": current_pf,
+            "target_pf": target_pf,
+            "groups_online": self.reactive_state.capacitor_groups_online,
+            "compensation_kvar": self.reactive_state.total_compensation_kvar,
+            "net_reactive_kvar": reactive_kvar - self.reactive_state.total_compensation_kvar,
+            "switch_event": None,
+            "limited_event": None,
+        }
+
+        required_kvar = self.calculate_required_compensation(active_kw, reactive_kvar, target_pf)
+        result["required_compensation_kvar"] = required_kvar
+
+        if required_kvar <= 0:
+            current_comp = self.reactive_state.capacitor_groups_online * kvar_per_group
+            if current_comp > 0:
+                excess_kvar = current_comp - max(0.0, reactive_kvar * 0.1)
+                if excess_kvar > kvar_per_group:
+                    groups_to_remove = min(
+                        self.reactive_state.capacitor_groups_online,
+                        int(excess_kvar / kvar_per_group)
+                    )
+                    can_switch, reason = self.can_switch(now)
+                    removable_count = len(self.get_online_groups_past_min_hold(now))
+                    actual_remove = min(groups_to_remove, removable_count)
+                    if can_switch and actual_remove > 0:
+                        event = self._switch_groups(
+                            0, actual_remove, active_kw, reactive_kvar,
+                            "过补偿切除多余电容组", False, now
+                        )
+                        result["action_taken"] = True
+                        result["switch_event"] = event
+                        result["groups_online"] = event.groups_after
+                        result["compensation_kvar"] = event.groups_after * kvar_per_group
+                        result["net_reactive_kvar"] = event.reactive_power_after_kvar
+
+            assessment = self._record_assessment(dispatch_id, active_kw, reactive_kvar, now)
+            result["assessment"] = assessment
+            return result
+
+        required_groups = math.ceil(required_kvar / kvar_per_group)
+        required_groups = min(required_groups, total_groups)
+        result["required_groups"] = required_groups
+
+        current_groups = self.reactive_state.capacitor_groups_online
+        groups_needed = required_groups - current_groups
+
+        if groups_needed <= 0:
+            assessment = self._record_assessment(dispatch_id, active_kw, reactive_kvar, now)
+            result["assessment"] = assessment
+            return result
+
+        can_switch, switch_reason = self.can_switch(now)
+        available_groups = len(self.get_offline_groups_available(now))
+        actual_add = min(groups_needed, available_groups)
+
+        if can_switch and actual_add > 0:
+            event = self._switch_groups(
+                actual_add, 0, active_kw, reactive_kvar,
+                "功率因数不达标，投入电容补偿", False, now
+            )
+            result["action_taken"] = True
+            result["switch_event"] = event
+            result["groups_online"] = event.groups_after
+            result["compensation_kvar"] = event.groups_after * kvar_per_group
+            result["net_reactive_kvar"] = event.reactive_power_after_kvar
+        elif not can_switch or actual_add == 0:
+            limited_event = CompensationLimitedEvent(
+                event_id=self._generate_limited_event_id(),
+                timestamp=now,
+                active_power_kw=active_kw,
+                reactive_power_kvar=reactive_kvar,
+                current_power_factor=current_pf,
+                target_power_factor=target_pf,
+                required_capacitor_groups=groups_needed,
+                available_capacitor_groups=available_groups,
+                reason=switch_reason if not can_switch else "无可用电容组可投入",
+                constraint_type="min_interval" if not can_switch else "no_available",
+            )
+            self.reactive_state.limited_events.append(limited_event)
+            history_size = config.REACTIVE_POWER_CONFIG["history_size"]
+            if len(self.reactive_state.limited_events) > history_size:
+                self.reactive_state.limited_events = self.reactive_state.limited_events[-history_size:]
+            result["limited_event"] = limited_event
+
+        assessment = self._record_assessment(dispatch_id, active_kw, reactive_kvar, now)
+        result["assessment"] = assessment
+        return result
+
+    def _record_assessment(self, dispatch_id: str, active_kw: float,
+                           reactive_kvar: float, now: datetime) -> PowerFactorAssessmentRecord:
+        import config
+
+        target_pf = config.REACTIVE_POWER_CONFIG["target_power_factor"]
+        penalty_per_percent = config.REACTIVE_POWER_CONFIG["penalty_per_percent_below"]
+
+        comp_kvar = self.reactive_state.total_compensation_kvar
+        net_reactive = reactive_kvar - comp_kvar
+        pf = self.calculate_power_factor(active_kw, net_reactive)
+
+        is_compliant = pf >= target_pf
+        penalty_amount = 0.0
+
+        if not is_compliant:
+            pf_diff_percent = (target_pf - pf) * 100
+            penalty_amount = math.ceil(pf_diff_percent) * penalty_per_percent
+            self.reactive_state.monthly_penalty += penalty_amount
+
+        record = PowerFactorAssessmentRecord(
+            record_id=self._generate_assessment_id(),
+            dispatch_id=dispatch_id,
+            timestamp=now,
+            active_power_kw=active_kw,
+            reactive_power_kvar=reactive_kvar,
+            power_factor=pf,
+            target_power_factor=target_pf,
+            is_compliant=is_compliant,
+            penalty_amount=penalty_amount,
+            capacitor_groups_online=self.reactive_state.capacitor_groups_online,
+            compensated_reactive_kvar=comp_kvar,
+        )
+
+        self.reactive_state.assessment_records.append(record)
+        history_size = config.REACTIVE_POWER_CONFIG["history_size"]
+        if len(self.reactive_state.assessment_records) > history_size:
+            self.reactive_state.assessment_records = self.reactive_state.assessment_records[-history_size:]
+
+        return record
+
+    def manual_switch(self, target_groups: int, now: datetime = None) -> Dict[str, Any]:
+        import config
+        if now is None:
+            now = datetime.now()
+
+        total_groups = config.REACTIVE_POWER_CONFIG["capacitor_total_groups"]
+        current_groups = self.reactive_state.capacitor_groups_online
+
+        if target_groups < 0 or target_groups > total_groups:
+            return {
+                "success": False,
+                "message": f"目标组数超出范围，有效范围: 0-{total_groups}",
+                "groups_online": current_groups,
+            }
+
+        delta = target_groups - current_groups
+
+        if delta == 0:
+            return {
+                "success": True,
+                "message": "电容组数未变化",
+                "groups_online": current_groups,
+            }
+
+        can_switch, reason = self.can_switch(now)
+        if not can_switch:
+            return {
+                "success": False,
+                "message": reason,
+                "groups_online": current_groups,
+            }
+
+        active_kw = self.reactive_state.total_active_power_kw
+        reactive_kvar = self.reactive_state.total_reactive_power_kvar
+
+        if delta > 0:
+            available = len(self.get_offline_groups_available(now))
+            actual_add = min(delta, available)
+            if actual_add < delta:
+                return {
+                    "success": False,
+                    "message": f"可投入电容组不足，需要{delta}组，仅{available}组可用",
+                    "groups_online": current_groups,
+                }
+            event = self._switch_groups(
+                actual_add, 0, active_kw, reactive_kvar,
+                "手动投入电容组", True, now
+            )
+        else:
+            removable = len(self.get_online_groups_past_min_hold(now))
+            actual_remove = min(-delta, removable)
+            if actual_remove < -delta:
+                return {
+                    "success": False,
+                    "message": f"可切除电容组不足，需要切除{-delta}组，仅{removable}组可切除（需满足最小投入时间）",
+                    "groups_online": current_groups,
+                }
+            event = self._switch_groups(
+                0, actual_remove, active_kw, reactive_kvar,
+                "手动切除电容组", True, now
+            )
+
+        return {
+            "success": True,
+            "message": "手动投切成功",
+            "groups_online": event.groups_after,
+            "switch_event": event,
+        }
+
+    def get_status(self) -> Dict[str, Any]:
+        import config
+        cfg = config.REACTIVE_POWER_CONFIG
+        return {
+            "total_active_power_kw": round(self.reactive_state.total_active_power_kw, 2),
+            "total_reactive_power_kvar": round(self.reactive_state.total_reactive_power_kvar, 2),
+            "current_power_factor": round(self.reactive_state.current_power_factor, 4),
+            "target_power_factor": cfg["target_power_factor"],
+            "capacitor_groups_online": self.reactive_state.capacitor_groups_online,
+            "capacitor_total_groups": cfg["capacitor_total_groups"],
+            "total_compensation_kvar": round(self.reactive_state.total_compensation_kvar, 2),
+            "kvar_per_group": cfg["capacitor_kvar_per_group"],
+            "net_reactive_kvar": round(
+                self.reactive_state.total_reactive_power_kvar - self.reactive_state.total_compensation_kvar, 2
+            ),
+            "last_switch_time": (
+                self.reactive_state.last_switch_time.isoformat()
+                if self.reactive_state.last_switch_time else None
+            ),
+            "monthly_penalty": round(self.reactive_state.monthly_penalty, 2),
+            "current_month": self.reactive_state.current_month,
+            "capacitor_detail": [
+                {
+                    "group_id": cs.group_id,
+                    "online": cs.online,
+                    "last_switch_time": cs.last_switch_time.isoformat() if cs.last_switch_time else None,
+                    "total_on_time_minutes": round(cs.total_on_time_minutes, 2),
+                    "switch_count": cs.switch_count,
+                }
+                for cs in self.reactive_state.capacitor_states
+            ],
+        }
+
+    def get_switch_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        history = self.reactive_state.switch_history[-limit:]
+        result = []
+        for event in reversed(history):
+            result.append({
+                "event_id": event.event_id,
+                "timestamp": event.timestamp.isoformat(),
+                "groups_before": event.groups_before,
+                "groups_after": event.groups_after,
+                "switch_delta": event.switch_delta,
+                "pf_before": round(event.pf_before, 4),
+                "pf_after": round(event.pf_after, 4),
+                "reactive_power_before_kvar": round(event.reactive_power_before_kvar, 2),
+                "reactive_power_after_kvar": round(event.reactive_power_after_kvar, 2),
+                "active_power_kw": round(event.active_power_kw, 2),
+                "reason": event.reason,
+                "is_manual": event.is_manual,
+            })
+        return result
+
+    def get_assessment_records(self, limit: int = 50) -> List[Dict[str, Any]]:
+        records = self.reactive_state.assessment_records[-limit:]
+        result = []
+        for record in reversed(records):
+            result.append({
+                "record_id": record.record_id,
+                "dispatch_id": record.dispatch_id,
+                "timestamp": record.timestamp.isoformat(),
+                "active_power_kw": round(record.active_power_kw, 2),
+                "reactive_power_kvar": round(record.reactive_power_kvar, 2),
+                "power_factor": round(record.power_factor, 4),
+                "target_power_factor": record.target_power_factor,
+                "is_compliant": record.is_compliant,
+                "penalty_amount": round(record.penalty_amount, 2),
+                "capacitor_groups_online": record.capacitor_groups_online,
+                "compensated_reactive_kvar": round(record.compensated_reactive_kvar, 2),
+            })
+        return result
+
+    def get_limited_events(self, limit: int = 50) -> List[Dict[str, Any]]:
+        events = self.reactive_state.limited_events[-limit:]
+        result = []
+        for event in reversed(events):
+            result.append({
+                "event_id": event.event_id,
+                "timestamp": event.timestamp.isoformat(),
+                "active_power_kw": round(event.active_power_kw, 2),
+                "reactive_power_kvar": round(event.reactive_power_kvar, 2),
+                "current_power_factor": round(event.current_power_factor, 4),
+                "target_power_factor": event.target_power_factor,
+                "required_capacitor_groups": event.required_capacitor_groups,
+                "available_capacitor_groups": event.available_capacitor_groups,
+                "reason": event.reason,
+                "constraint_type": event.constraint_type,
+            })
+        return result
+
+    def get_monthly_summary(self, year_month: str = None) -> Dict[str, Any]:
+        import config
+        cfg = config.REACTIVE_POWER_CONFIG
+
+        if year_month is None:
+            year_month = self.reactive_state.current_month
+
+        monthly_records = [
+            r for r in self.reactive_state.assessment_records
+            if r.timestamp.strftime("%Y-%m") == year_month
+        ]
+
+        total_periods = len(monthly_records)
+        compliant_periods = sum(1 for r in monthly_records if r.is_compliant)
+        non_compliant_periods = total_periods - compliant_periods
+        total_penalty = sum(r.penalty_amount for r in monthly_records)
+        avg_power_factor = (
+            sum(r.power_factor for r in monthly_records) / total_periods
+            if total_periods > 0 else 1.0
+        )
+        min_power_factor = (
+            min(r.power_factor for r in monthly_records)
+            if monthly_records else 1.0
+        )
+
+        return {
+            "year_month": year_month,
+            "total_dispatch_periods": total_periods,
+            "compliant_periods": compliant_periods,
+            "non_compliant_periods": non_compliant_periods,
+            "compliance_rate": round(compliant_periods / total_periods * 100, 2) if total_periods > 0 else 100.0,
+            "total_penalty": round(total_penalty, 2),
+            "average_power_factor": round(avg_power_factor, 4),
+            "min_power_factor": round(min_power_factor, 4),
+            "penalty_per_percent": cfg["penalty_per_percent_below"],
+        }
+
+
 class MicrogridState:
     HEALTH_WINDOW_SIZE = 50
     HEALTH_WARNING_THRESHOLD = 60.0
@@ -831,6 +1420,7 @@ class MicrogridState:
                 "shed_priority": cfg["shed_priority"],
                 "restore_priority": cfg["restore_priority"],
                 "reported_power_kw": 0.0,
+                "reported_reactive_kvar": 0.0,
                 "current_served_kw": 0.0,
                 "current_shed_kw": 0.0,
                 "last_report_time": None,
@@ -873,6 +1463,9 @@ class MicrogridState:
         self._active_maintenance_restrictions: Dict[str, MaintenanceRestriction] = {}
         self._bess_original_soc_limits: Dict[str, Dict[str, float]] = {}
 
+        self.reactive_power_manager = None
+        self._init_reactive_power_manager()
+
         from day_ahead_engine import DayAheadDispatchEngine
         self.day_ahead_engine = DayAheadDispatchEngine(self)
         self.day_ahead_forecasts: Dict[str, DayAheadForecast] = {}
@@ -889,6 +1482,9 @@ class MicrogridState:
     def _init_arbitrage_analyzer(self):
         from arbitrage_analyzer import ArbitrageAnalyzer
         self.arbitrage_analyzer = ArbitrageAnalyzer(self)
+
+    def _init_reactive_power_manager(self):
+        self.reactive_power_manager = ReactivePowerCompensationManager(self)
 
     def report_source(self, report: SourceReport):
         if report.source_type == "pv":
@@ -911,10 +1507,12 @@ class MicrogridState:
         for gid, gr in report.group_reports.items():
             if gid in self.load_group_state:
                 self.load_group_state[gid]["reported_power_kw"] = max(0.0, gr.actual_power_kw)
+                self.load_group_state[gid]["reported_reactive_kvar"] = max(0.0, gr.reactive_power_kvar)
                 self.load_group_state[gid]["last_report_time"] = gr.timestamp
                 self.load_group_reports[gid] = gr
 
-    def report_load_group(self, group_id: str, actual_power_kw: float, timestamp: datetime = None):
+    def report_load_group(self, group_id: str, actual_power_kw: float,
+                          reactive_power_kvar: float = 0.0, timestamp: datetime = None):
         if timestamp is None:
             timestamp = datetime.now()
         if group_id not in self.load_group_state:
@@ -923,28 +1521,42 @@ class MicrogridState:
         gr = LoadGroupReport(
             group_id=group_id,
             actual_power_kw=max(0.0, actual_power_kw),
+            reactive_power_kvar=max(0.0, reactive_power_kvar),
             timestamp=timestamp,
         )
         self.load_group_reports[group_id] = gr
         self.load_group_state[group_id]["reported_power_kw"] = gr.actual_power_kw
+        self.load_group_state[group_id]["reported_reactive_kvar"] = gr.reactive_power_kvar
         self.load_group_state[group_id]["last_report_time"] = timestamp
 
-        total = self._compute_total_load_from_groups()
+        total_active, total_reactive = self._compute_total_load_from_groups()
         if self.load_report is None:
             self.load_report = LoadReport(
-                load_kw=total,
+                load_kw=total_active,
+                reactive_load_kvar=total_reactive,
                 timestamp=timestamp,
                 group_reports={group_id: gr},
             )
         else:
-            self.load_report.load_kw = total
+            self.load_report.load_kw = total_active
+            self.load_report.reactive_load_kvar = total_reactive
             self.load_report.timestamp = timestamp
             self.load_report.group_reports[group_id] = gr
 
-    def _compute_total_load_from_groups(self) -> float:
+    def _compute_total_load_from_groups(self) -> Tuple[float, float]:
+        total_active = 0.0
+        total_reactive = 0.0
+        for gid, gs in self.load_group_state.items():
+            total_active += max(0.0, gs["reported_power_kw"])
+            total_reactive += max(0.0, gs["reported_reactive_kvar"])
+        return total_active, total_reactive
+
+    def get_total_reactive_load_kvar(self) -> float:
+        if self.load_report and self.load_report.reactive_load_kvar > 0:
+            return max(0.0, self.load_report.reactive_load_kvar)
         total = 0.0
         for gid, gs in self.load_group_state.items():
-            total += max(0.0, gs["reported_power_kw"])
+            total += max(0.0, gs["reported_reactive_kvar"])
         return total
 
     def all_groups_reported(self) -> bool:

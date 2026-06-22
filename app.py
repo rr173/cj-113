@@ -3842,6 +3842,154 @@ def get_day_ahead_forecast_detail(forecast_id):
     })
 
 
+@app.route("/api/reactive-power/status", methods=["GET"])
+def get_reactive_power_status():
+    """
+    查询当前并网点功率因数和无功状态
+    返回: 总有功、总无功、当前功率因数、已投入电容组数等
+    """
+    status = state.reactive_power_manager.get_status()
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "reactive_power_status": status,
+    })
+
+
+@app.route("/api/reactive-power/switch-history", methods=["GET"])
+def get_capacitor_switch_history():
+    """
+    查询电容投切历史
+    参数: limit (可选，默认50)
+    """
+    try:
+        limit = int(request.args.get("limit", 50))
+        limit = max(1, min(limit, 500))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+
+    history = state.reactive_power_manager.get_switch_history(limit=limit)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "total": len(state.reactive_power_manager.reactive_state.switch_history),
+        "returned": len(history),
+        "limit": limit,
+        "history": history,
+    })
+
+
+@app.route("/api/reactive-power/assessment-records", methods=["GET"])
+def get_power_factor_assessment_records():
+    """
+    查询功率因数考核记录
+    参数: limit (可选，默认50)
+    """
+    try:
+        limit = int(request.args.get("limit", 50))
+        limit = max(1, min(limit, 500))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+
+    records = state.reactive_power_manager.get_assessment_records(limit=limit)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "total": len(state.reactive_power_manager.reactive_state.assessment_records),
+        "returned": len(records),
+        "limit": limit,
+        "records": records,
+    })
+
+
+@app.route("/api/reactive-power/limited-events", methods=["GET"])
+def get_compensation_limited_events():
+    """
+    查询补偿受限事件
+    参数: limit (可选，默认50)
+    """
+    try:
+        limit = int(request.args.get("limit", 50))
+        limit = max(1, min(limit, 500))
+    except ValueError:
+        return jsonify({"error": "limit 必须是整数"}), 400
+
+    events = state.reactive_power_manager.get_limited_events(limit=limit)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "total": len(state.reactive_power_manager.reactive_state.limited_events),
+        "returned": len(events),
+        "limit": limit,
+        "events": events,
+    })
+
+
+@app.route("/api/reactive-power/monthly-summary", methods=["GET"])
+def get_power_factor_monthly_summary():
+    """
+    查询功率因数月度考核汇总
+    参数: year_month (可选，格式YYYY-MM，默认当月)
+    """
+    year_month = request.args.get("year_month")
+    summary = state.reactive_power_manager.get_monthly_summary(year_month=year_month)
+    return jsonify({
+        "status": "ok",
+        "query_time": datetime.now().isoformat(),
+        "summary": summary,
+    })
+
+
+@app.route("/api/reactive-power/manual-switch", methods=["POST"])
+def manual_capacitor_switch():
+    """
+    手动投切指定数量的电容组（覆盖自动逻辑，用于检修测试）
+    请求体: {
+        "target_groups": 3  (目标投入的电容组数，0-6)
+    }
+    """
+    data = request.get_json(force=True) or {}
+    if "target_groups" not in data:
+        return jsonify({"error": "缺少必填字段: target_groups"}), 400
+
+    try:
+        target_groups = int(data["target_groups"])
+    except (ValueError, TypeError):
+        return jsonify({"error": "target_groups 必须是整数"}), 400
+
+    total_groups = config.REACTIVE_POWER_CONFIG["capacitor_total_groups"]
+    if target_groups < 0 or target_groups > total_groups:
+        return jsonify({"error": f"target_groups 必须在 0-{total_groups} 之间"}), 400
+
+    result = state.reactive_power_manager.manual_switch(target_groups)
+
+    if result["success"]:
+        switch_event = result.get("switch_event")
+        return jsonify({
+            "status": "ok",
+            "message": result["message"],
+            "groups_online": result["groups_online"],
+            "switch_event": {
+                "event_id": switch_event.event_id,
+                "timestamp": switch_event.timestamp.isoformat(),
+                "groups_before": switch_event.groups_before,
+                "groups_after": switch_event.groups_after,
+                "switch_delta": switch_event.switch_delta,
+                "pf_before": round(switch_event.pf_before, 4),
+                "pf_after": round(switch_event.pf_after, 4),
+                "reason": switch_event.reason,
+                "is_manual": switch_event.is_manual,
+            } if switch_event else None,
+            "current_status": state.reactive_power_manager.get_status(),
+        })
+    else:
+        return jsonify({
+            "status": "error",
+            "message": result["message"],
+            "groups_online": result["groups_online"],
+        }), 400
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("电力微网调度与储能管理服务启动中...")

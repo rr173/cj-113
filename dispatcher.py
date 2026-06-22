@@ -1527,6 +1527,59 @@ class DispatchEngine:
 
         self.state.add_dispatch(decision)
 
+        reactive_compensation_result = None
+        if config.REACTIVE_POWER_CONFIG.get("enable_reactive_compensation", False):
+            total_active_kw = load_served
+            total_reactive_kvar = self.state.get_total_reactive_load_kvar()
+            reactive_compensation_result = self.state.reactive_power_manager.execute_compensation(
+                active_kw=total_active_kw,
+                reactive_kvar=total_reactive_kvar,
+                dispatch_id=dispatch_id,
+                now=now,
+            )
+            if reactive_compensation_result.get("action_taken"):
+                switch_event = reactive_compensation_result.get("switch_event")
+                if switch_event:
+                    notes.append(
+                        f"[无功补偿] 电容组投切: {switch_event.groups_before}组 → {switch_event.groups_after}组, "
+                        f"功率因数: {switch_event.pf_before:.4f} → {switch_event.pf_after:.4f}, "
+                        f"原因: {switch_event.reason}"
+                    )
+            assessment = reactive_compensation_result.get("assessment")
+            if assessment and not assessment.is_compliant:
+                notes.append(
+                    f"[功率因数考核] 不达标: 当前{assessment.power_factor:.4f}, "
+                    f"目标{assessment.target_power_factor}, 罚款{assessment.penalty_amount:.2f}元"
+                )
+                self.state.add_alert(
+                    "POWER_FACTOR_PENALTY",
+                    f"功率因数不达标，本次调度罚款{assessment.penalty_amount:.2f}元，"
+                    f"月度累计罚款{self.state.reactive_power_manager.reactive_state.monthly_penalty:.2f}元",
+                    {
+                        "dispatch_id": dispatch_id,
+                        "power_factor": assessment.power_factor,
+                        "target_power_factor": assessment.target_power_factor,
+                        "penalty_amount": assessment.penalty_amount,
+                        "monthly_penalty": self.state.reactive_power_manager.reactive_state.monthly_penalty,
+                    }
+                )
+            if reactive_compensation_result.get("limited_event"):
+                limited_event = reactive_compensation_result.get("limited_event")
+                notes.append(
+                    f"[补偿受限] {limited_event.reason}"
+                )
+                self.state.add_alert(
+                    "REACTIVE_COMPENSATION_LIMITED",
+                    f"无功补偿受限: {limited_event.reason}",
+                    {
+                        "dispatch_id": dispatch_id,
+                        "current_power_factor": limited_event.current_power_factor,
+                        "required_groups": limited_event.required_capacitor_groups,
+                        "available_groups": limited_event.available_capacitor_groups,
+                        "constraint_type": limited_event.constraint_type,
+                    }
+                )
+
         carbon_record = None
         carbon_exceed_penalty = 0.0
         if carbon_enabled:
